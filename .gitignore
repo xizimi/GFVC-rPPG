@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.npy
+*.pth.tar
+*.pth
+*.pkl
+*.mp4
+*.avi
+*.gif
+checkpoint/
+.env
