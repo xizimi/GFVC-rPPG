@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from modules.util import ResBlock2d, SameBlock2d, UpBlock2d, DownBlock2d, ResBlock3d, SPADEResnetBlock
 from modules.dense_motion import DenseMotionNetwork
+from modules.rppg import RPPGFusion, TemporalRPPGEncoder, SkinPhysiologyResidual
 
 
 class OcclusionAwareGenerator(nn.Module):
@@ -11,7 +12,8 @@ class OcclusionAwareGenerator(nn.Module):
     """
 
     def __init__(self, image_channel, feature_channel, num_kp, block_expansion, max_features, num_down_blocks, reshape_channel, reshape_depth,
-                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None, estimate_jacobian=False):
+                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None,
+                 estimate_jacobian=False, physiology_params=None):
         super(OcclusionAwareGenerator, self).__init__()
 
         if dense_motion_params is not None:
@@ -21,7 +23,7 @@ class OcclusionAwareGenerator(nn.Module):
         else:
             self.dense_motion_network = None
 
-        self.first = SameBlock2d(image_channel, block_expansion, kernel_size=(7, 7), padding=(3, 3))
+        self.first = SameBlock2d(image_channel, block_expansion, kernel_size=(3, 3), padding=(1, 1))
 
         down_blocks = []
         for i in range(num_down_blocks):
@@ -58,6 +60,21 @@ class OcclusionAwareGenerator(nn.Module):
         self.estimate_occlusion_map = estimate_occlusion_map
         self.image_channel = image_channel
 
+        self.rppg_fusion = RPPGFusion(out_features)
+        physiology_params = {} if physiology_params is None else physiology_params
+        condition_dim = physiology_params.get('condition_dim', 64)
+        self.physiology_encoder = TemporalRPPGEncoder(
+            embedding_dim=condition_dim,
+            hidden_dim=physiology_params.get('hidden_dim', 64),
+            num_blocks=physiology_params.get('num_blocks', 4),
+        )
+        self.physiology_residual = SkinPhysiologyResidual(
+            feature_channels=block_expansion,
+            condition_dim=condition_dim,
+            hidden_channels=physiology_params.get('residual_channels', 64),
+            max_delta=physiology_params.get('max_delta', 4.0 / 255.0),
+        )
+
     def deform_input(self, inp, deformation):
         _, d_old, h_old, w_old, _ = deformation.shape
         _, _, d, h, w = inp.shape
@@ -67,7 +84,27 @@ class OcclusionAwareGenerator(nn.Module):
             deformation = deformation.permute(0, 2, 3, 4, 1)
         return F.grid_sample(inp, deformation)
 
-    def forward(self, source_image, kp_driving, kp_source):
+    @staticmethod
+    def _select_physiology_condition(encoded, frame_index):
+        batch_size, time, _ = encoded.shape
+        if frame_index is None:
+            if time != 1:
+                raise ValueError("rppg_frame_index is required for multi-frame target_rppg")
+            return encoded[:, 0]
+        if not torch.is_tensor(frame_index):
+            frame_index = torch.full((batch_size,), int(frame_index),
+                                     dtype=torch.long, device=encoded.device)
+        else:
+            frame_index = frame_index.to(device=encoded.device, dtype=torch.long).view(-1)
+            if frame_index.numel() == 1:
+                frame_index = frame_index.expand(batch_size)
+        if frame_index.numel() != batch_size:
+            raise ValueError("rppg_frame_index must be scalar or have one value per batch item")
+        frame_index = frame_index.clamp(0, time - 1)
+        return encoded[torch.arange(batch_size, device=encoded.device), frame_index]
+
+    def forward(self, source_image, kp_driving, kp_source, rppg_feat=None,
+                target_rppg=None, rppg_frame_index=None, skin_mask=None):
         # Encoding (downsampling) part
         out = self.first(source_image)
         for i in range(len(self.down_blocks)):
@@ -105,14 +142,29 @@ class OcclusionAwareGenerator(nn.Module):
 
             # output_dict["deformed"] = self.deform_input(source_image, deformation)  # 3d deformation cannot deform 2d image
 
+        # rPPG injection
+        if rppg_feat is not None:
+            out = self.rppg_fusion(out, rppg_feat)
+
         # Decoding part
         out = self.resblocks_2d(out)
         for i in range(len(self.up_blocks)):
             out = self.up_blocks[i](out)
-        out = self.final(out)
-        out = F.sigmoid(out)
+        base_prediction = torch.sigmoid(self.final(out))
 
-        output_dict["prediction"] = out
+        physiology_delta = None
+        if target_rppg is not None:
+            encoded_rppg = self.physiology_encoder(target_rppg)
+            condition = self._select_physiology_condition(encoded_rppg, rppg_frame_index)
+            physiology_delta = self.physiology_residual(out, condition, skin_mask)
+            prediction = torch.clamp(base_prediction + physiology_delta, 0.0, 1.0)
+        else:
+            prediction = base_prediction
+
+        output_dict["prediction"] = prediction
+        output_dict["prediction_base"] = base_prediction
+        if physiology_delta is not None:
+            output_dict["physiology_delta"] = physiology_delta
 
         return output_dict
 
@@ -161,7 +213,8 @@ class SPADEDecoder(nn.Module):
 class OcclusionAwareSPADEGenerator(nn.Module):
 
     def __init__(self, image_channel, feature_channel, num_kp, block_expansion, max_features, num_down_blocks, reshape_channel, reshape_depth,
-                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None, estimate_jacobian=False):
+                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None,
+                 estimate_jacobian=False, physiology_params=None):
         super(OcclusionAwareSPADEGenerator, self).__init__()
 
         if dense_motion_params is not None:
@@ -196,7 +249,24 @@ class OcclusionAwareSPADEGenerator(nn.Module):
         self.estimate_occlusion_map = estimate_occlusion_map
         self.image_channel = image_channel
 
+        self.rppg_fusion = RPPGFusion(out_features)
+
         self.decoder = SPADEDecoder()
+        physiology_params = {} if physiology_params is None else physiology_params
+        condition_dim = physiology_params.get('condition_dim', 64)
+        self.physiology_encoder = TemporalRPPGEncoder(
+            embedding_dim=condition_dim,
+            hidden_dim=physiology_params.get('hidden_dim', 64),
+            num_blocks=physiology_params.get('num_blocks', 4),
+        )
+        # SPADEDecoder returns RGB directly, so its bounded physiology residual
+        # is conditioned on the baseline RGB prediction.
+        self.physiology_residual = SkinPhysiologyResidual(
+            feature_channels=3,
+            condition_dim=condition_dim,
+            hidden_channels=physiology_params.get('residual_channels', 64),
+            max_delta=physiology_params.get('max_delta', 4.0 / 255.0),
+        )
 
     def deform_input(self, inp, deformation):
         _, d_old, h_old, w_old, _ = deformation.shape
@@ -207,7 +277,27 @@ class OcclusionAwareSPADEGenerator(nn.Module):
             deformation = deformation.permute(0, 2, 3, 4, 1)
         return F.grid_sample(inp, deformation)
 
-    def forward(self, source_image, kp_driving, kp_source):
+    @staticmethod
+    def _select_physiology_condition(encoded, frame_index):
+        batch_size, time, _ = encoded.shape
+        if frame_index is None:
+            if time != 1:
+                raise ValueError("rppg_frame_index is required for multi-frame target_rppg")
+            return encoded[:, 0]
+        if not torch.is_tensor(frame_index):
+            frame_index = torch.full((batch_size,), int(frame_index),
+                                     dtype=torch.long, device=encoded.device)
+        else:
+            frame_index = frame_index.to(device=encoded.device, dtype=torch.long).view(-1)
+            if frame_index.numel() == 1:
+                frame_index = frame_index.expand(batch_size)
+        if frame_index.numel() != batch_size:
+            raise ValueError("rppg_frame_index must be scalar or have one value per batch item")
+        frame_index = frame_index.clamp(0, time - 1)
+        return encoded[torch.arange(batch_size, device=encoded.device), frame_index]
+
+    def forward(self, source_image, kp_driving, kp_source, rppg_feat=None,
+                target_rppg=None, rppg_frame_index=None, skin_mask=None):
         # Encoding (downsampling) part
         out = self.first(source_image)
         for i in range(len(self.down_blocks)):
@@ -243,9 +333,31 @@ class OcclusionAwareSPADEGenerator(nn.Module):
                     occlusion_map = F.interpolate(occlusion_map, size=out.shape[2:], mode='bilinear')
                 out = out * occlusion_map
 
-        # Decoding part
-        out = self.decoder(out)
+        # rPPG injection
+        if rppg_feat is not None:
+            out = self.rppg_fusion(out, rppg_feat)
 
-        output_dict["prediction"] = out
+        # Decoding part
+        base_prediction = self.decoder(out)
+        physiology_delta = None
+        if target_rppg is not None:
+            encoded_rppg = self.physiology_encoder(target_rppg)
+            condition = self._select_physiology_condition(encoded_rppg, rppg_frame_index)
+            physiology_delta = self.physiology_residual(
+                base_prediction, condition, skin_mask
+            )
+            prediction = torch.clamp(base_prediction + physiology_delta, 0.0, 1.0)
+        else:
+            prediction = base_prediction
+
+        output_dict["prediction"] = prediction
+        output_dict["prediction_base"] = base_prediction
+        if physiology_delta is not None:
+            output_dict["physiology_delta"] = physiology_delta
 
         return output_dict
+
+
+
+
+

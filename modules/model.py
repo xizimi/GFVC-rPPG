@@ -7,6 +7,7 @@ import numpy as np
 from torch.autograd import grad
 import modules.hopenet as hopenet
 from torchvision import transforms
+from modules.rppg import physiological_losses
 
 
 class Vgg19(torch.nn.Module):
@@ -271,7 +272,17 @@ class GeneratorFullModel(torch.nn.Module):
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian)
         kp_driving = keypoint_transformation(kp_canonical, he_driving, self.estimate_jacobian)
 
-        generated = self.generator(x['source'], kp_source=kp_source, kp_driving=kp_driving)
+        # Unified three-condition generator. Legacy frame-pair training may pass
+        # rppg_driving; sequence training passes the complete target_rppg and a
+        # frame index. No batch averaging is allowed here.
+        target_rppg = x.get('target_rppg', None)
+        rppg_frame_index = x.get('rppg_frame_index', None)
+        skin_mask = x.get('skin_mask_driving', None)
+        generated = self.generator(
+            x['source'], kp_source=kp_source, kp_driving=kp_driving,
+            target_rppg=target_rppg, rppg_frame_index=rppg_frame_index,
+            skin_mask=skin_mask,
+        )
         generated.update({'kp_source': kp_source, 'kp_driving': kp_driving})
 
         loss_values = {}
@@ -354,6 +365,15 @@ class GeneratorFullModel(torch.nn.Module):
                 value = torch.abs(eye - value).mean()
                 loss_values['equivariance_jacobian'] = self.loss_weights['equivariance_jacobian'] * value
 
+        # Image-space regularizers for the bounded physiology branch. Complete
+        # waveform supervision is computed by GFVCRPPGSequenceModel after the
+        # generated clip is re-encoded by a frozen skin-ROI rPPG extractor.
+        if 'physiology_delta' in generated:
+            delta = generated['physiology_delta']
+            loss_values['physiology_residual'] = (
+                delta.abs().mean() * self.loss_weights.get('physiology_residual', 0)
+            )
+
         if self.loss_weights['keypoint'] != 0:
             # print(kp_driving['value'].shape)     # (bs, k, 3)
             value_total = 0
@@ -394,6 +414,119 @@ class GeneratorFullModel(torch.nn.Module):
             loss_values['expression'] = self.loss_weights['expression'] * value
 
         return loss_values, generated
+
+
+class GFVCRPPGSequenceModel(torch.nn.Module):
+    """Stage-2 training wrapper for G(I_key, motion, target_rPPG).
+
+    The GFVC generator produces a full clip one frame at a time while sharing a
+    waveform encoding across all frames. A frozen rPPG extractor then re-encodes
+    *only the masked skin region* of the generated clip. Gradients flow through
+    the extractor to the generator, but never update extractor weights.
+    """
+
+    def __init__(self, kp_extractor, he_estimator, generator, rppg_extractor,
+                 loss_weights=None, estimate_jacobian=True):
+        super().__init__()
+        self.kp_extractor = kp_extractor
+        self.he_estimator = he_estimator
+        self.generator = generator
+        self.rppg_extractor = rppg_extractor
+        self.estimate_jacobian = estimate_jacobian
+        self.loss_weights = {
+            'pearson': 1.0,
+            'waveform': 0.5,
+            'spectral': 1.0,
+            'kl': 0.1,
+            'bpm': 0.01,
+            'visual': 10.0,
+            'residual': 1.0,
+            'temporal_smooth': 0.5,
+        }
+        if loss_weights is not None:
+            self.loss_weights.update(loss_weights)
+        self.rppg_extractor.eval()
+        for parameter in self.rppg_extractor.parameters():
+            parameter.requires_grad_(False)
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Freeze both parameters and running statistics of the pretrained GFVC
+        # backbone. Only the newly added physiology modules enter train mode.
+        self.kp_extractor.eval()
+        self.he_estimator.eval()
+        self.generator.eval()
+        self.generator.physiology_encoder.train(mode)
+        self.generator.physiology_residual.train(mode)
+        # Keep BatchNorm/GRU behavior of the physiological teacher fixed.
+        self.rppg_extractor.eval()
+        return self
+
+    def forward(self, batch, epoch=0, total_epochs=1):
+        source = batch['source']
+        driving = batch['driving_video']
+        target = batch['target_rppg'].float()
+        masks = batch['skin_masks'].float()
+        if driving.dim() != 5 or masks.dim() != 5:
+            raise ValueError('driving_video and skin_masks must be (B,T,C,H,W)')
+        if driving.shape[:2] != target.shape or driving.shape[:2] != masks.shape[:2]:
+            raise ValueError('video, masks, and target_rppg must share B and T')
+
+        batch_size, time = target.shape
+        kp_canonical = self.kp_extractor(source)
+        he_source = self.he_estimator(source)
+        kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian)
+
+        predictions, baselines, deltas = [], [], []
+        for frame_index in range(time):
+            he_driving = self.he_estimator(driving[:, frame_index])
+            kp_driving = keypoint_transformation(
+                kp_canonical, he_driving, self.estimate_jacobian
+            )
+            generated = self.generator(
+                source, kp_source=kp_source, kp_driving=kp_driving,
+                target_rppg=target, rppg_frame_index=frame_index,
+                skin_mask=masks[:, frame_index],
+            )
+            predictions.append(generated['prediction'])
+            baselines.append(generated['prediction_base'])
+            deltas.append(generated['physiology_delta'])
+
+        prediction = torch.stack(predictions, dim=1)
+        baseline = torch.stack(baselines, dim=1)
+        delta = torch.stack(deltas, dim=1)
+        masked_prediction = prediction * masks
+        extracted = self.rppg_extractor(masked_prediction)
+
+        fps = batch.get('fps', 30.0)
+        if torch.is_tensor(fps):
+            # Windows in a batch are expected to use the same sampling rate.
+            fps = float(fps.flatten()[0].detach().cpu())
+        physiology = physiological_losses(extracted, target, fps)
+        progress = float(epoch) / max(float(total_epochs), 1.0)
+        alpha = 0.1 * (0.5 ** progress)
+        beta = 1.0 * (5.0 ** progress)
+        losses = {
+            'rppg_pearson': alpha * self.loss_weights['pearson'] * physiology['pearson'],
+            'rppg_waveform': self.loss_weights['waveform'] * physiology['waveform'],
+            'rppg_spectral': beta * self.loss_weights['spectral'] * physiology['spectral'],
+            'rppg_kl': beta * self.loss_weights['kl'] * physiology['kl'],
+            'rppg_bpm': self.loss_weights['bpm'] * physiology['bpm'],
+            'visual_preservation': self.loss_weights['visual'] * F.l1_loss(prediction, baseline),
+            'physiology_residual': self.loss_weights['residual'] * delta.abs().mean(),
+        }
+        if time >= 3:
+            acceleration = delta[:, 2:] - 2.0 * delta[:, 1:-1] + delta[:, :-2]
+            losses['temporal_smooth'] = (
+                self.loss_weights['temporal_smooth'] * acceleration.abs().mean()
+            )
+        output = {
+            'prediction': prediction,
+            'prediction_base': baseline,
+            'physiology_delta': delta,
+            'rppg_extracted': extracted,
+        }
+        return losses, output
 
 
 class DiscriminatorFullModel(torch.nn.Module):
@@ -444,3 +577,8 @@ class DiscriminatorFullModel(torch.nn.Module):
         loss_values['disc_gan'] = value_total
 
         return loss_values
+
+
+
+
+

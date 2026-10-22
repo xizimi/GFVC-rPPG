@@ -47,6 +47,12 @@ model_params:
       # reshape_channel: 32
       reshape_depth: 16
       compress: 4
+    physiology_params:
+      condition_dim: 64
+      hidden_dim: 64
+      num_blocks: 4
+      residual_channels: 64
+      max_delta: 0.0156862745  # 4 / 255
   discriminator_params:
     scales: [1]
     block_expansion: 32                 
@@ -81,8 +87,19 @@ train_params:
     keypoint: 10
     headpose: 20
     expression: 5
+    physiology_residual: 0
+  physiology_loss_weights:
+    pearson: 1.0
+    waveform: 0.5
+    spectral: 1.0
+    kl: 0.1
+    bpm: 0.01
+    visual: 10.0
+    residual: 1.0
+    temporal_smooth: 0.5
 
 visualizer_params:
   kp_size: 5
   draw_border: True
   colormap: 'gist_rainbow'
+
