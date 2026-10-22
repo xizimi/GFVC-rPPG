@@ -1,6 +1,9 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import importlib.util
+import sys
 
 
 class RPPGEncoder(nn.Module):
@@ -256,3 +259,40 @@ def physiological_losses(pred, target, fps, eps=1e-8):
         "kl": symmetric_kl,
         "bpm": F.l1_loss(pred_bpm, target_bpm),
     }
+
+
+class RePPGTeacherAdapter(nn.Module):
+    """Frozen adapter around the pretrained rePPG Step-2 Hourglass teacher.
+
+    The teacher is used only as a differentiable measurement network: gradients
+    flow through its input back to GFVC, but its parameters are never updated.
+    Input is RGB ``[B,T,3,H,W]`` and output is ``[B,T]``.
+    """
+    def __init__(self, project_root, checkpoint, base_filter=16, gray=True):
+        super().__init__()
+        model_path = os.path.join(project_root, 'model.py')
+        spec = importlib.util.spec_from_file_location('reppg_reference_model', model_path)
+        if spec is None or spec.loader is None:
+            raise ImportError('Cannot import rePPG reference model from ' + model_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        self.teacher = module.HourglassNetStep2(baseFilter=base_filter, gray=gray)
+        state = torch.load(checkpoint, map_location='cpu')
+        if isinstance(state, dict) and 'state_dict' in state:
+            state = state['state_dict']
+        self.teacher.load_state_dict(state, strict=False)
+        for parameter in self.teacher.parameters():
+            parameter.requires_grad_(False)
+        self.teacher.eval()
+
+    def train(self, mode=True):
+        # Keep BatchNorm/dropout deterministic even when the parent enters train().
+        super().train(False)
+        self.teacher.eval()
+        return self
+
+    def forward(self, video):
+        if video.dim() != 5:
+            raise ValueError('teacher input must be [B,T,3,H,W]')
+        return self.teacher.get_rppg_only(video)

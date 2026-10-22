@@ -11,7 +11,7 @@ from tqdm import tqdm
 from modules.generator import OcclusionAwareGenerator, OcclusionAwareSPADEGenerator
 from modules.keypoint_detector import KPDetector, HEEstimator
 from modules.model import GFVCRPPGSequenceModel
-from modules.rppg import RPPGEncoder
+from modules.rppg import RPPGEncoder, RePPGTeacherAdapter
 from rppg_gfvc_dataset import GFVCRPPGWindowDataset
 
 
@@ -55,6 +55,8 @@ def main():
     parser.add_argument('--data_root', default='/opt/data/private/datasets/UBFC2_fv2v/train')
     parser.add_argument('--gfvc_checkpoint', required=True)
     parser.add_argument('--rppg_checkpoint', required=True)
+    parser.add_argument('--rppg_backend', choices=['reppg', 'native'], default='reppg')
+    parser.add_argument('--reppg_root', default='/opt/data/private/project/rePPG-Rewriting-Photoplethysmography-Signal-to-Video-master')
     parser.add_argument('--output', default='checkpoint/gfvc_rppg_stage2.pth.tar')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=1)
@@ -84,11 +86,14 @@ def main():
         args.gfvc_checkpoint, generator, kp_detector, he_estimator
     )
 
-    rppg_extractor = RPPGEncoder()
-    rppg_state = torch.load(args.rppg_checkpoint, map_location='cpu')
-    if isinstance(rppg_state, dict) and 'state_dict' in rppg_state:
-        rppg_state = rppg_state['state_dict']
-    rppg_extractor.load_state_dict(rppg_state)
+    if args.rppg_backend == 'reppg':
+        rppg_extractor = RePPGTeacherAdapter(args.reppg_root, args.rppg_checkpoint)
+    else:
+        rppg_extractor = RPPGEncoder()
+        rppg_state = torch.load(args.rppg_checkpoint, map_location='cpu')
+        if isinstance(rppg_state, dict) and 'state_dict' in rppg_state:
+            rppg_state = rppg_state['state_dict']
+        rppg_extractor.load_state_dict(rppg_state)
 
     trainable = set_stage2_trainable(generator, kp_detector, he_estimator)
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
