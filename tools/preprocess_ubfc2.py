@@ -33,31 +33,34 @@ def detect_face_bbox(frame, detector):
     return int(x), int(y), int(w), int(h)
 
 
-def expand_to_square(bbox, frame_shape, margin=1.25):
-    x, y, w, h = bbox
-    cx, cy = x + w / 2, y + h / 2
-    side = max(w, h) * margin
-    left = int(round(cx - side / 2))
-    right = int(round(cx + side / 2))
-    top = int(round(cy - side / 2))
-    bot = int(round(cy + side / 2))
+def fixed_crop_box(bbox, frame_shape, size=256):
+    """Return one fixed, in-bounds ``size x size`` crop around the face.
 
+    The crop is computed once from the detected face centre and reused for every
+    frame.  In particular, frames are *not* resized: this preserves a common
+    pixel coordinate system for motion and rPPG colour changes.
+    """
     fh, fw = frame_shape[:2]
-    # keep aspect ratio while clamping inside the frame
-    side = min(right - left, bot - top)
-    left = max(0, min(left, fw - side))
-    top = max(0, min(top, fh - side))
-    right = left + side
-    bot = top + side
-    return left, top, right, bot
+    if fh < size or fw < size:
+        raise ValueError(
+            'Frame %dx%d is smaller than fixed crop %dx%d; refusing to resize' %
+            (fw, fh, size, size)
+        )
+    x, y, w, h = bbox
+    cx, cy = x + w / 2.0, y + h / 2.0
+    left = int(round(cx - size / 2.0))
+    top = int(round(cy - size / 2.0))
+    left = max(0, min(left, fw - size))
+    top = max(0, min(top, fh - size))
+    return left, top, left + size, top + size
 
 
-def crop_face(frame, bbox, size=256):
-    left, top, right, bot = expand_to_square(bbox, frame.shape)
-    crop = frame[top:bot, left:right]
-    if crop.size == 0:
-        crop = frame
-    return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+def crop_fixed(frame, crop_box):
+    left, top, right, bottom = crop_box
+    crop = frame[top:bottom, left:right]
+    if crop.shape[:2] != (bottom - top, right - left):
+        raise RuntimeError('Fixed crop unexpectedly falls outside the frame')
+    return crop
 
 
 def find_face_bbox(video_path, detector, probes=(0, 0.25, 0.5, 0.75, 0.9)):
@@ -112,12 +115,17 @@ def process_subject(
     n = min(n_signal, n_frames)
 
     bbox = find_face_bbox(video_path, detector)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    ok, reference_frame = cap.read()
+    if not ok:
+        cap.release()
+        return None
     if bbox is None:
         # safe fallback: central crop
-        ok, frame = cap.read()
-        h, w = frame.shape[:2]
+        h, w = reference_frame.shape[:2]
         side = min(h, w)
         bbox = ((w - side) // 2, (h - side) // 2, side, side)
+    crop_box = fixed_crop_box(bbox, reference_frame.shape, size=size)
 
     subject_name = os.path.basename(subject_dir)
     subject_out = os.path.join(out_dir, subject_name)
@@ -147,7 +155,7 @@ def process_subject(
             ok, frame = cap.read()
             if not ok:
                 break
-            frames.append(crop_face(frame, bbox, size=size))
+            frames.append(crop_fixed(frame, crop_box))
             written += 1
 
         if not frames:
@@ -160,6 +168,7 @@ def process_subject(
             "rppg_signal": rppg[start : start + written],
             "hr": hr[start : start + written],
             "time": time[start : start + written],
+            "fps": float(fps),
         }
         np.save(sig_path, window_sig, allow_pickle=True)
         windows.append(
@@ -187,8 +196,9 @@ def process_subject(
         "n_windows": int(len(windows)),
         "window_size": int(window_size),
         "step_size": int(step_size),
-        "size": int(size),
+        "crop_size": int(size),
         "bbox": [int(v) for v in bbox],
+        "fixed_crop_box_xyxy": [int(v) for v in crop_box],
         "windows": windows,
     }
     with open(meta_path, "w", encoding="utf-8") as f:

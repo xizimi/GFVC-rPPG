@@ -173,8 +173,8 @@ class SkinPhysiologyResidual(nn.Module):
 
     The last layer is zero initialized, so adding this module to a pretrained
     GFVC generator initially leaves its output bit-for-bit unchanged (up to the
-    final clamp). The caller supplies a soft skin mask; non-skin pixels cannot
-    be modified by this branch.
+    final clamp). Skin localization is learned from the masked training losses;
+    no mask is required in the receiver's transmitted input.
     """
 
     def __init__(self, feature_channels, condition_dim=64, hidden_channels=64,
@@ -194,7 +194,7 @@ class SkinPhysiologyResidual(nn.Module):
         nn.init.zeros_(self.residual[-1].weight)
         nn.init.zeros_(self.residual[-1].bias)
 
-    def forward(self, feature, condition, skin_mask):
+    def forward(self, feature, condition):
         if condition.dim() != 2:
             raise ValueError("condition must have shape (B, D)")
         gamma, beta = self.affine(condition).chunk(2, dim=1)
@@ -203,16 +203,7 @@ class SkinPhysiologyResidual(nn.Module):
         conditioned = feature * (1.0 + gamma) + beta
         delta = self.max_delta * torch.tanh(self.residual(conditioned))
 
-        if skin_mask is None:
-            raise ValueError("skin_mask is required when target_rppg is used")
-        if skin_mask.dim() == 3:
-            skin_mask = skin_mask.unsqueeze(1)
-        if skin_mask.shape[1] != 1:
-            skin_mask = skin_mask.mean(dim=1, keepdim=True)
-        if skin_mask.shape[-2:] != delta.shape[-2:]:
-            skin_mask = F.interpolate(skin_mask.float(), size=delta.shape[-2:],
-                                      mode="bilinear", align_corners=False)
-        return delta * skin_mask.clamp(0.0, 1.0)
+        return delta
 
 
 def negative_pearson_loss(pred, target, eps=1e-8):
@@ -236,28 +227,57 @@ def normalized_power_spectrum(signal, fps, low_hz=0.7, high_hz=3.0,
     return power / (power.sum(dim=-1, keepdim=True) + eps), frequencies[valid]
 
 
-def physiological_losses(pred, target, fps, eps=1e-8):
+def physiological_losses(pred, target, fps, target_bpm=None, eps=1e-8):
     """Stable time/frequency losses for complete-waveform supervision."""
     if pred.shape != target.shape:
         raise ValueError("predicted and target waveforms must have equal shape")
     pred_norm = (pred - pred.mean(-1, keepdim=True)) / (pred.std(-1, keepdim=True) + eps)
     target_norm = (target - target.mean(-1, keepdim=True)) / (target.std(-1, keepdim=True) + eps)
-    pred_psd, frequencies = normalized_power_spectrum(pred, fps, eps=eps)
-    target_psd, _ = normalized_power_spectrum(target, fps, eps=eps)
-    spectral = F.l1_loss(pred_psd, target_psd)
-    kl_pt = (pred_psd * ((pred_psd + eps).log() - (target_psd + eps).log())).sum(-1)
-    kl_tp = (target_psd * ((target_psd + eps).log() - (pred_psd + eps).log())).sum(-1)
-    symmetric_kl = 0.5 * (kl_pt + kl_tp).mean()
-    # Differentiable heart-rate estimate used only for training.
-    temperature = 0.05
-    pred_bpm = 60.0 * (torch.softmax(pred_psd / temperature, dim=-1) * frequencies).sum(-1)
-    target_bpm = 60.0 * (torch.softmax(target_psd / temperature, dim=-1) * frequencies).sum(-1)
+    fps_values = torch.as_tensor(fps).flatten().tolist()
+    if len(fps_values) == 1:
+        fps_values *= pred.shape[0]
+    if len(fps_values) != pred.shape[0]:
+        raise ValueError('fps must be scalar or contain one value per sample')
+    if target_bpm is not None:
+        target_bpm = torch.as_tensor(target_bpm, device=pred.device,
+                                     dtype=pred.dtype).flatten()
+        if target_bpm.numel() != pred.shape[0]:
+            raise ValueError('target_bpm must contain one value per sample')
+
+    spectral_terms, kl_terms, bpm_terms = [], [], []
+    for index, sample_fps in enumerate(fps_values):
+        pred_psd, frequencies = normalized_power_spectrum(
+            pred[index:index + 1], sample_fps, eps=eps
+        )
+        target_psd, _ = normalized_power_spectrum(
+            target[index:index + 1], sample_fps, eps=eps
+        )
+        spectral_terms.append(F.l1_loss(pred_psd, target_psd))
+        # A small probability floor avoids excessive KL from nearly empty FFT bins.
+        pred_kl = pred_psd.clamp_min(1e-4)
+        target_kl = target_psd.clamp_min(1e-4)
+        pred_kl = pred_kl / pred_kl.sum(dim=-1, keepdim=True)
+        target_kl = target_kl / target_kl.sum(dim=-1, keepdim=True)
+        kl_pt = (pred_kl * (pred_kl.log() - target_kl.log())).sum(-1)
+        kl_tp = (target_kl * (target_kl.log() - pred_kl.log())).sum(-1)
+        kl_terms.append(0.5 * (kl_pt + kl_tp).mean())
+        # Soft frequency selection is differentiable; the target is measured HR.
+        pred_hr = 60.0 * (
+            torch.softmax(pred_psd / 0.05, dim=-1) * frequencies
+        ).sum(-1)
+        if target_bpm is None or not torch.isfinite(target_bpm[index]):
+            target_hr = 60.0 * (
+                torch.softmax(target_psd / 0.05, dim=-1) * frequencies
+            ).sum(-1)
+        else:
+            target_hr = target_bpm[index:index + 1]
+        bpm_terms.append(F.l1_loss(pred_hr, target_hr))
     return {
         "pearson": negative_pearson_loss(pred, target, eps),
         "waveform": F.smooth_l1_loss(pred_norm, target_norm),
-        "spectral": spectral,
-        "kl": symmetric_kl,
-        "bpm": F.l1_loss(pred_bpm, target_bpm),
+        "spectral": torch.stack(spectral_terms).mean(),
+        "kl": torch.stack(kl_terms).mean(),
+        "bpm": torch.stack(bpm_terms).mean(),
     }
 
 
@@ -266,7 +286,8 @@ class RePPGTeacherAdapter(nn.Module):
 
     The teacher is used only as a differentiable measurement network: gradients
     flow through its input back to GFVC, but its parameters are never updated.
-    Input is RGB ``[B,T,3,H,W]`` and output is ``[B,T]``.
+    Input is RGB ``[B,T,3,H,W]`` and output is ``[B,T]``. The reference
+    dataloader passes its OpenCV-stored BGR arrays to the teacher unchanged.
     """
     def __init__(self, project_root, checkpoint, base_filter=16, gray=True):
         super().__init__()
@@ -281,7 +302,7 @@ class RePPGTeacherAdapter(nn.Module):
         state = torch.load(checkpoint, map_location='cpu')
         if isinstance(state, dict) and 'state_dict' in state:
             state = state['state_dict']
-        self.teacher.load_state_dict(state, strict=False)
+        self.teacher.load_state_dict(state, strict=True)
         for parameter in self.teacher.parameters():
             parameter.requires_grad_(False)
         self.teacher.eval()
@@ -295,4 +316,17 @@ class RePPGTeacherAdapter(nn.Module):
     def forward(self, video):
         if video.dim() != 5:
             raise ValueError('teacher input must be [B,T,3,H,W]')
-        return self.teacher.get_rppg_only(video)
+        video = video[:, :, [2, 1, 0]]  # GFVC RGB -> reference teacher BGR
+        # The reference get_rppg_only writes rppg[0] into every batch row and
+        # divides by a zero range for constant predictions. Keep its learned
+        # layers while fixing both issues here, without changing the checkpoint.
+        features = []
+        for frame_index in range(video.shape[1]):
+            frame = self.teacher.pre_conv(video[:, frame_index])
+            frame = F.relu(self.teacher.pre_bn(frame))
+            _, _, rppg = self.teacher.HG3(frame, None, None, 0, 0)
+            features.append(rppg[:, :, 0, 0])
+        values = self.teacher.rppg_ffn(torch.stack(features, dim=1)).squeeze(-1)
+        minimum = values.amin(dim=-1, keepdim=True)
+        amplitude = values.amax(dim=-1, keepdim=True) - minimum
+        return (values - minimum) / amplitude.clamp_min(1e-6)

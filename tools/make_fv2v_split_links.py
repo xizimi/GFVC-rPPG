@@ -12,9 +12,9 @@ def replace_link(target, link):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--processed', default='/opt/data/private/datasets/UBFC2_processed')
+    parser.add_argument('--processed', default='/opt/data/private/datasets/UBFC2_fixed256_processed')
     parser.add_argument('--splits', default='splits.json')
-    parser.add_argument('--out', default='/opt/data/private/datasets/UBFC2_fv2v')
+    parser.add_argument('--out', default='/opt/data/private/datasets/UBFC2_fixed256_fv2v')
     args = parser.parse_args()
     with open(args.splits, encoding='utf-8') as handle:
         splits = json.load(handle)

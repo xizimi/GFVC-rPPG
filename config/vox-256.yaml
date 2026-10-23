@@ -92,10 +92,11 @@ train_params:
     pearson: 1.0
     waveform: 0.5
     spectral: 1.0
-    kl: 0.1
-    bpm: 0.01
+    kl: 0.01
+    bpm: 0.001
     visual: 10.0
-    residual: 1.0
+    outside_skin: 10.0
+    residual: 0.0
     temporal_smooth: 0.5
 
 visualizer_params:

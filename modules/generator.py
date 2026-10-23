@@ -104,7 +104,8 @@ class OcclusionAwareGenerator(nn.Module):
         return encoded[torch.arange(batch_size, device=encoded.device), frame_index]
 
     def forward(self, source_image, kp_driving, kp_source, rppg_feat=None,
-                target_rppg=None, rppg_frame_index=None, skin_mask=None):
+                target_rppg=None, rppg_frame_index=None, skin_mask=None,
+                physiology_condition=None):
         # Encoding (downsampling) part
         out = self.first(source_image)
         for i in range(len(self.down_blocks)):
@@ -153,10 +154,13 @@ class OcclusionAwareGenerator(nn.Module):
         base_prediction = torch.sigmoid(self.final(out))
 
         physiology_delta = None
-        if target_rppg is not None:
-            encoded_rppg = self.physiology_encoder(target_rppg)
-            condition = self._select_physiology_condition(encoded_rppg, rppg_frame_index)
-            physiology_delta = self.physiology_residual(out, condition, skin_mask)
+        if target_rppg is not None or physiology_condition is not None:
+            if physiology_condition is None:
+                encoded_rppg = self.physiology_encoder(target_rppg)
+                condition = self._select_physiology_condition(encoded_rppg, rppg_frame_index)
+            else:
+                condition = physiology_condition
+            physiology_delta = self.physiology_residual(out, condition)
             prediction = torch.clamp(base_prediction + physiology_delta, 0.0, 1.0)
         else:
             prediction = base_prediction
@@ -297,7 +301,8 @@ class OcclusionAwareSPADEGenerator(nn.Module):
         return encoded[torch.arange(batch_size, device=encoded.device), frame_index]
 
     def forward(self, source_image, kp_driving, kp_source, rppg_feat=None,
-                target_rppg=None, rppg_frame_index=None, skin_mask=None):
+                target_rppg=None, rppg_frame_index=None, skin_mask=None,
+                physiology_condition=None):
         # Encoding (downsampling) part
         out = self.first(source_image)
         for i in range(len(self.down_blocks)):
@@ -340,11 +345,14 @@ class OcclusionAwareSPADEGenerator(nn.Module):
         # Decoding part
         base_prediction = self.decoder(out)
         physiology_delta = None
-        if target_rppg is not None:
-            encoded_rppg = self.physiology_encoder(target_rppg)
-            condition = self._select_physiology_condition(encoded_rppg, rppg_frame_index)
+        if target_rppg is not None or physiology_condition is not None:
+            if physiology_condition is None:
+                encoded_rppg = self.physiology_encoder(target_rppg)
+                condition = self._select_physiology_condition(encoded_rppg, rppg_frame_index)
+            else:
+                condition = physiology_condition
             physiology_delta = self.physiology_residual(
-                base_prediction, condition, skin_mask
+                base_prediction, condition
             )
             prediction = torch.clamp(base_prediction + physiology_delta, 0.0, 1.0)
         else:

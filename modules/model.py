@@ -437,10 +437,11 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
             'pearson': 1.0,
             'waveform': 0.5,
             'spectral': 1.0,
-            'kl': 0.1,
-            'bpm': 0.01,
+            'kl': 0.01,
+            'bpm': 0.001,
             'visual': 10.0,
-            'residual': 1.0,
+            'outside_skin': 10.0,
+            'residual': 0.0,
             'temporal_smooth': 0.5,
         }
         if loss_weights is not None:
@@ -476,6 +477,7 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
         kp_canonical = self.kp_extractor(source)
         he_source = self.he_estimator(source)
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian)
+        encoded_rppg = self.generator.physiology_encoder(target)
 
         predictions, baselines, deltas = [], [], []
         for frame_index in range(time):
@@ -485,8 +487,7 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
             )
             generated = self.generator(
                 source, kp_source=kp_source, kp_driving=kp_driving,
-                target_rppg=target, rppg_frame_index=frame_index,
-                skin_mask=masks[:, frame_index],
+                physiology_condition=encoded_rppg[:, frame_index],
             )
             predictions.append(generated['prediction'])
             baselines.append(generated['prediction_base'])
@@ -498,11 +499,10 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
         masked_prediction = prediction * masks
         extracted = self.rppg_extractor(masked_prediction)
 
-        fps = batch.get('fps', 30.0)
-        if torch.is_tensor(fps):
-            # Windows in a batch are expected to use the same sampling rate.
-            fps = float(fps.flatten()[0].detach().cpu())
-        physiology = physiological_losses(extracted, target, fps)
+        physiology = physiological_losses(
+            extracted, target, batch.get('fps', 30.0),
+            target_bpm=batch.get('target_bpm'),
+        )
         progress = float(epoch) / max(float(total_epochs), 1.0)
         alpha = 0.1 * (0.5 ** progress)
         beta = 1.0 * (5.0 ** progress)
@@ -513,6 +513,8 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
             'rppg_kl': beta * self.loss_weights['kl'] * physiology['kl'],
             'rppg_bpm': self.loss_weights['bpm'] * physiology['bpm'],
             'visual_preservation': self.loss_weights['visual'] * F.l1_loss(prediction, baseline),
+            'outside_skin': self.loss_weights['outside_skin'] *
+                (delta.abs() * (1.0 - masks)).mean(),
             'physiology_residual': self.loss_weights['residual'] * delta.abs().mean(),
         }
         if time >= 3:
