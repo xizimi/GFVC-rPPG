@@ -1,5 +1,6 @@
 import os
 import torch
+from torch.utils.checkpoint import checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 import importlib.util
@@ -59,6 +60,97 @@ class RPPGEncoder(nn.Module):
         rppg = self.rppg_head(temporal)             # (B, T, 1)
         rppg = rppg.squeeze(-1)                     # (B, T)
         return rppg
+
+
+class _TemporalResidualBlock(nn.Module):
+    """Dilated, length-preserving temporal residual block."""
+
+    def __init__(self, channels, dilation):
+        super().__init__()
+        padding = dilation * 2
+        self.layers = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=5, padding=padding,
+                      dilation=dilation, bias=False),
+            nn.GroupNorm(8, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv1d(channels, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(8, channels),
+        )
+
+    def forward(self, value):
+        return F.silu(value + self.layers(value))
+
+
+class SkinRPPGTeacher(nn.Module):
+    """Differentiable rPPG teacher trained directly on masked face videos.
+
+    The input is RGB video in ``[B, T, 3, H, W]`` where non-skin pixels have
+    already been set to zero by the caller. GroupNorm keeps this model stable
+    with the small batches required by 150-frame training windows. It returns
+    an unnormalised waveform in ``[B, T]``; losses standardise it as needed.
+    """
+
+    # cuDNN only implements GRU input gradients in training mode.  This
+    # teacher deliberately uses GroupNorm and no dropout, so enabling training
+    # mode changes neither its learned statistics nor its deterministic output;
+    # its parameters remain frozen by GFVCRPPGSequenceModel.
+    requires_train_mode_for_input_grad = True
+
+    def __init__(self, channels=32, temporal_channels=128, gru_hidden=96):
+        super().__init__()
+        def spatial_block(in_channels, out_channels, stride):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 5, stride=stride,
+                          padding=2, bias=False),
+                nn.GroupNorm(8, out_channels),
+                nn.SiLU(inplace=True),
+            )
+
+        self.spatial = nn.Sequential(
+            spatial_block(3, channels, 2),
+            spatial_block(channels, channels * 2, 2),
+            spatial_block(channels * 2, channels * 4, 2),
+            spatial_block(channels * 4, channels * 4, 2),
+        )
+        feature_channels = channels * 4
+        self.attention = nn.Conv2d(feature_channels, 1, kernel_size=1)
+        self.temporal_input = nn.Sequential(
+            nn.Conv1d(feature_channels * 2, temporal_channels, 1, bias=False),
+            nn.GroupNorm(8, temporal_channels),
+            nn.SiLU(inplace=True),
+        )
+        self.temporal = nn.Sequential(
+            _TemporalResidualBlock(temporal_channels, 1),
+            _TemporalResidualBlock(temporal_channels, 2),
+            _TemporalResidualBlock(temporal_channels, 4),
+            _TemporalResidualBlock(temporal_channels, 8),
+        )
+        self.gru = nn.GRU(temporal_channels, gru_hidden, num_layers=1,
+                          batch_first=True, bidirectional=True)
+        self.head = nn.Sequential(
+            nn.Linear(gru_hidden * 2, gru_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(gru_hidden, 1),
+        )
+
+    def forward(self, video):
+        if video.dim() != 5:
+            raise ValueError('video must have shape [B, T, 3, H, W]')
+        batch, time, channels, height, width = video.shape
+        if channels != 3:
+            raise ValueError('SkinRPPGTeacher expects RGB input')
+        features = self.spatial(video.reshape(batch * time, channels, height, width))
+        _, feature_channels, feature_height, feature_width = features.shape
+        attention = self.attention(features).reshape(batch * time, 1, -1)
+        attention = torch.softmax(attention, dim=-1)
+        flattened = features.reshape(batch * time, feature_channels, -1)
+        attended = (flattened * attention).sum(dim=-1)
+        average = flattened.mean(dim=-1)
+        spatial_features = torch.cat([attended, average], dim=1)
+        temporal = spatial_features.view(batch, time, -1).transpose(1, 2)
+        temporal = self.temporal(self.temporal_input(temporal)).transpose(1, 2)
+        temporal, _ = self.gru(temporal)
+        return self.head(temporal).squeeze(-1)
 
 
 class RPPGDecoder(nn.Module):
@@ -289,7 +381,8 @@ class RePPGTeacherAdapter(nn.Module):
     Input is RGB ``[B,T,3,H,W]`` and output is ``[B,T]``. The reference
     dataloader passes its OpenCV-stored BGR arrays to the teacher unchanged.
     """
-    def __init__(self, project_root, checkpoint, base_filter=16, gray=True):
+    def __init__(self, project_root, checkpoint, base_filter=16, gray=True,
+                 checkpoint_frames=False):
         super().__init__()
         model_path = os.path.join(project_root, 'model.py')
         spec = importlib.util.spec_from_file_location('reppg_reference_model', model_path)
@@ -303,6 +396,7 @@ class RePPGTeacherAdapter(nn.Module):
         if isinstance(state, dict) and 'state_dict' in state:
             state = state['state_dict']
         self.teacher.load_state_dict(state, strict=True)
+        self.checkpoint_frames = bool(checkpoint_frames)
         for parameter in self.teacher.parameters():
             parameter.requires_grad_(False)
         self.teacher.eval()
@@ -313,6 +407,12 @@ class RePPGTeacherAdapter(nn.Module):
         self.teacher.eval()
         return self
 
+    def _frame_features(self, frame):
+        frame = self.teacher.pre_conv(frame)
+        frame = F.relu(self.teacher.pre_bn(frame))
+        _, _, rppg = self.teacher.HG3(frame, None, None, 0, 0)
+        return rppg[:, :, 0, 0]
+
     def forward(self, video):
         if video.dim() != 5:
             raise ValueError('teacher input must be [B,T,3,H,W]')
@@ -322,10 +422,12 @@ class RePPGTeacherAdapter(nn.Module):
         # layers while fixing both issues here, without changing the checkpoint.
         features = []
         for frame_index in range(video.shape[1]):
-            frame = self.teacher.pre_conv(video[:, frame_index])
-            frame = F.relu(self.teacher.pre_bn(frame))
-            _, _, rppg = self.teacher.HG3(frame, None, None, 0, 0)
-            features.append(rppg[:, :, 0, 0])
+            frame = video[:, frame_index]
+            if getattr(self, 'checkpoint_frames', False) and torch.is_grad_enabled():
+                features.append(checkpoint(self._frame_features, frame,
+                                           use_reentrant=False))
+            else:
+                features.append(self._frame_features(frame))
         values = self.teacher.rppg_ffn(torch.stack(features, dim=1)).squeeze(-1)
         minimum = values.amin(dim=-1, keepdim=True)
         amplitude = values.amax(dim=-1, keepdim=True) - minimum

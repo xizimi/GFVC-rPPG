@@ -14,7 +14,8 @@ from tqdm import tqdm
 from modules.generator import OcclusionAwareGenerator, OcclusionAwareSPADEGenerator
 from modules.keypoint_detector import KPDetector, HEEstimator
 from modules.model import GFVCRPPGSequenceModel
-from modules.rppg import RPPGEncoder, RePPGTeacherAdapter, negative_pearson_loss
+from modules.rppg import (RPPGEncoder, RePPGTeacherAdapter, SkinRPPGTeacher,
+                          negative_pearson_loss)
 from rppg_gfvc_dataset import GFVCRPPGWindowDataset
 
 
@@ -92,25 +93,31 @@ def save_checkpoint(path, state):
 
 @torch.no_grad()
 def teacher_preflight(teacher, dataset, device, subject_count):
-    """Measure teacher/cPPG correlation on distinct held-out subjects."""
-    seen, correlations = set(), []
+    """Measure all windows for each selected held-out subject."""
+    selected, by_subject = [], {}
     for index, (face_path, _, _, _) in enumerate(dataset.samples):
         subject = os.path.basename(face_path).split('_clip')[0]
-        if subject in seen:
-            continue
+        if subject not in by_subject:
+            if len(selected) >= subject_count:
+                continue
+            selected.append(subject)
+            by_subject[subject] = []
         sample = dataset[index]
         video = (sample['driving_video'] * sample['skin_masks']).unsqueeze(0).to(device)
         target = sample['original_rppg'].unsqueeze(0).to(device)
         extracted = teacher(video)
         correlation = 1.0 - float(negative_pearson_loss(extracted, target))
-        correlations.append(correlation)
-        seen.add(subject)
-        print('teacher preflight %s: Pearson %.3f' % (subject, correlation), flush=True)
-        if len(correlations) >= subject_count:
-            break
-    if not correlations:
+        by_subject[subject].append(correlation)
+    if not by_subject:
         raise RuntimeError('Teacher preflight found no validation subjects')
-    return sum(correlations) / len(correlations)
+    means = []
+    for subject in selected:
+        values = by_subject[subject]
+        mean = sum(values) / len(values)
+        means.append(mean)
+        print('teacher preflight %s: windows=%d mean Pearson %.3f' %
+              (subject, len(values), mean), flush=True)
+    return sum(means) / len(means)
 
 
 def main():
@@ -121,7 +128,7 @@ def main():
     parser.add_argument('--val_data_root', default='/opt/data/private/datasets/UBFC2_fixed256_fv2v/val')
     parser.add_argument('--gfvc_checkpoint', required=True)
     parser.add_argument('--rppg_checkpoint', required=True)
-    parser.add_argument('--rppg_backend', choices=['reppg', 'native'], default='reppg')
+    parser.add_argument('--rppg_backend', choices=['reppg', 'native', 'skin'], default='reppg')
     parser.add_argument('--reppg_root', default='/opt/data/private/project/rePPG-Rewriting-Photoplethysmography-Signal-to-Video-master')
     parser.add_argument('--output', default='checkpoint/gfvc_rppg_stage2.pth.tar')
     parser.add_argument('--epochs', type=int, default=50)
@@ -171,11 +178,17 @@ def main():
 
     if args.rppg_backend == 'reppg':
         rppg_extractor = RePPGTeacherAdapter(args.reppg_root, args.rppg_checkpoint)
-    else:
+    elif args.rppg_backend == 'native':
         rppg_extractor = RPPGEncoder()
         rppg_state = torch.load(args.rppg_checkpoint, map_location='cpu')
         if isinstance(rppg_state, dict) and 'state_dict' in rppg_state:
             rppg_state = rppg_state['state_dict']
+        rppg_extractor.load_state_dict(rppg_state)
+    else:
+        rppg_extractor = SkinRPPGTeacher()
+        rppg_state = torch.load(args.rppg_checkpoint, map_location='cpu')
+        if isinstance(rppg_state, dict) and 'model' in rppg_state:
+            rppg_state = rppg_state['model']
         rppg_extractor.load_state_dict(rppg_state)
 
     trainable = set_stage2_trainable(generator, kp_detector, he_estimator)
@@ -227,7 +240,7 @@ def main():
             preserve_validation = validation
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
 
-    if args.rppg_backend == 'reppg' and not args.skip_teacher_preflight:
+    if args.rppg_backend in ('reppg', 'skin') and not args.skip_teacher_preflight:
         mean_correlation = teacher_preflight(
             rppg_extractor, preserve_validation, device,
             args.teacher_preflight_subjects,

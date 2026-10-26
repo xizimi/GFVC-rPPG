@@ -459,8 +459,14 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
         self.generator.eval()
         self.generator.physiology_encoder.train(mode)
         self.generator.physiology_residual.train(mode)
-        # Keep BatchNorm/GRU behavior of the physiological teacher fixed.
-        self.rppg_extractor.eval()
+        # Most frozen teachers stay in eval mode. SkinRPPGTeacher is a
+        # GroupNorm/no-dropout model with a cuDNN GRU; cuDNN requires training
+        # mode to backpropagate from its output to the generated input frames.
+        # This never unfreezes teacher parameters.
+        if getattr(self.rppg_extractor, 'requires_train_mode_for_input_grad', False):
+            self.rppg_extractor.train(mode)
+        else:
+            self.rppg_extractor.eval()
         return self
 
     def forward(self, batch, epoch=0, total_epochs=1):

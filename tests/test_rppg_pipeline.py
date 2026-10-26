@@ -6,8 +6,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from modules.rppg import RePPGTeacherAdapter, physiological_losses
+from modules.rppg import RePPGTeacherAdapter, SkinRPPGTeacher, physiological_losses
 from rppg_gfvc_dataset import GFVCRPPGWindowDataset
+from train_gfvc_rppg import teacher_preflight
 
 
 class _FakeHourglass(nn.Module):
@@ -27,6 +28,39 @@ class _FakeTeacher(nn.Module):
 
 
 class RPPGPipelineTests(unittest.TestCase):
+    def test_skin_teacher_has_full_waveform_gradient(self):
+        teacher = SkinRPPGTeacher(channels=8, temporal_channels=32, gru_hidden=16)
+        video = torch.rand(1, 9, 3, 32, 32, requires_grad=True)
+        waveform = teacher(video)
+        self.assertEqual(tuple(waveform.shape), (1, 9))
+        waveform.square().mean().backward()
+        self.assertTrue(torch.isfinite(video.grad).all())
+
+    def test_teacher_preflight_averages_all_windows_per_subject(self):
+        class Dataset:
+            samples = [
+                ('subject1_clip0.face.npy', None, None, None),
+                ('subject1_clip1.face.npy', None, None, None),
+                ('subject2_clip0.face.npy', None, None, None),
+            ]
+
+            def __getitem__(self, index):
+                video = torch.zeros(3, 3, 2, 2)
+                video[:, 0] = torch.tensor([0., 1., 2.])[:, None, None]
+                target = torch.tensor([0., 1., 2.])
+                if index == 1:
+                    target = -target
+                return {'driving_video': video,
+                        'skin_masks': torch.ones(3, 1, 2, 2),
+                        'original_rppg': target}
+
+        class Teacher(nn.Module):
+            def forward(self, video):
+                return video[:, :, 0].mean(dim=(2, 3))
+
+        score = teacher_preflight(Teacher(), Dataset(), torch.device('cpu'), 2)
+        self.assertAlmostEqual(score, 0.5, places=5)
+
     def test_teacher_keeps_batch_rows_separate(self):
         adapter = RePPGTeacherAdapter.__new__(RePPGTeacherAdapter)
         nn.Module.__init__(adapter)
