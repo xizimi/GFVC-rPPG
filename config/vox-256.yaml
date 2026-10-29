@@ -52,6 +52,8 @@ model_params:
       hidden_dim: 64
       num_blocks: 4
       residual_channels: 64
+      rank: 2
+      free_residual_scale: 0.0
       max_delta: 0.0156862745  # 4 / 255
   discriminator_params:
     scales: [1]
@@ -96,6 +98,7 @@ train_params:
     bpm: 0.001
     visual: 10.0
     outside_skin: 10.0
+    skin_mask: 0.1
     residual: 0.0
     temporal_smooth: 0.5
 

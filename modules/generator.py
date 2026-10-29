@@ -69,10 +69,12 @@ class OcclusionAwareGenerator(nn.Module):
             num_blocks=physiology_params.get('num_blocks', 4),
         )
         self.physiology_residual = SkinPhysiologyResidual(
-            feature_channels=block_expansion,
+            feature_channels=3,
             condition_dim=condition_dim,
             hidden_channels=physiology_params.get('residual_channels', 64),
             max_delta=physiology_params.get('max_delta', 4.0 / 255.0),
+            rank=physiology_params.get('rank', 2),
+            free_residual_scale=physiology_params.get('free_residual_scale', 0.0),
         )
 
     def deform_input(self, inp, deformation):
@@ -105,7 +107,7 @@ class OcclusionAwareGenerator(nn.Module):
 
     def forward(self, source_image, kp_driving, kp_source, rppg_feat=None,
                 target_rppg=None, rppg_frame_index=None, skin_mask=None,
-                physiology_condition=None):
+                physiology_condition=None, physiology_value=None):
         # Encoding (downsampling) part
         out = self.first(source_image)
         for i in range(len(self.down_blocks)):
@@ -160,7 +162,16 @@ class OcclusionAwareGenerator(nn.Module):
                 condition = self._select_physiology_condition(encoded_rppg, rppg_frame_index)
             else:
                 condition = physiology_condition
-            physiology_delta = self.physiology_residual(out, condition)
+            if physiology_value is None:
+                if target_rppg is None:
+                    raise ValueError('physiology_value is required with pre-encoded conditions')
+                physiology_value = self._select_physiology_condition(
+                    target_rppg.unsqueeze(-1), rppg_frame_index
+                ).squeeze(-1)
+            physiology_output = self.physiology_residual(
+                base_prediction, condition, physiology_value
+            )
+            physiology_delta = physiology_output['delta']
             prediction = torch.clamp(base_prediction + physiology_delta, 0.0, 1.0)
         else:
             prediction = base_prediction
@@ -169,6 +180,8 @@ class OcclusionAwareGenerator(nn.Module):
         output_dict["prediction_base"] = base_prediction
         if physiology_delta is not None:
             output_dict["physiology_delta"] = physiology_delta
+            output_dict["physiology_skin_mask"] = physiology_output['skin_mask']
+            output_dict["physiology_response_maps"] = physiology_output['response_maps']
 
         return output_dict
 
@@ -270,6 +283,8 @@ class OcclusionAwareSPADEGenerator(nn.Module):
             condition_dim=condition_dim,
             hidden_channels=physiology_params.get('residual_channels', 64),
             max_delta=physiology_params.get('max_delta', 4.0 / 255.0),
+            rank=physiology_params.get('rank', 2),
+            free_residual_scale=physiology_params.get('free_residual_scale', 0.0),
         )
 
     def deform_input(self, inp, deformation):
@@ -302,7 +317,7 @@ class OcclusionAwareSPADEGenerator(nn.Module):
 
     def forward(self, source_image, kp_driving, kp_source, rppg_feat=None,
                 target_rppg=None, rppg_frame_index=None, skin_mask=None,
-                physiology_condition=None):
+                physiology_condition=None, physiology_value=None):
         # Encoding (downsampling) part
         out = self.first(source_image)
         for i in range(len(self.down_blocks)):
@@ -351,9 +366,16 @@ class OcclusionAwareSPADEGenerator(nn.Module):
                 condition = self._select_physiology_condition(encoded_rppg, rppg_frame_index)
             else:
                 condition = physiology_condition
-            physiology_delta = self.physiology_residual(
-                base_prediction, condition
+            if physiology_value is None:
+                if target_rppg is None:
+                    raise ValueError('physiology_value is required with pre-encoded conditions')
+                physiology_value = self._select_physiology_condition(
+                    target_rppg.unsqueeze(-1), rppg_frame_index
+                ).squeeze(-1)
+            physiology_output = self.physiology_residual(
+                base_prediction, condition, physiology_value
             )
+            physiology_delta = physiology_output['delta']
             prediction = torch.clamp(base_prediction + physiology_delta, 0.0, 1.0)
         else:
             prediction = base_prediction
@@ -362,6 +384,8 @@ class OcclusionAwareSPADEGenerator(nn.Module):
         output_dict["prediction_base"] = base_prediction
         if physiology_delta is not None:
             output_dict["physiology_delta"] = physiology_delta
+            output_dict["physiology_skin_mask"] = physiology_output['skin_mask']
+            output_dict["physiology_response_maps"] = physiology_output['response_maps']
 
         return output_dict
 

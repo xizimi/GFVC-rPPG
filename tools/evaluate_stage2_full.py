@@ -25,7 +25,8 @@ if PROJECT_ROOT not in sys.path:
 from modules.generator import OcclusionAwareSPADEGenerator
 from modules.keypoint_detector import HEEstimator, KPDetector
 from modules.model import GFVCRPPGSequenceModel
-from modules.rppg import SkinRPPGTeacher, physiological_losses
+from modules.rppg import (SkinRPPGTeacher, normalized_power_spectrum,
+                          physiological_losses)
 from rppg_gfvc_dataset import GFVCRPPGWindowDataset
 from train_gfvc_rppg import load_component_checkpoint, move_batch
 
@@ -58,12 +59,19 @@ def build_model(args, device):
     return model, saved
 
 
+def hard_peak_bpm(waveform, fps):
+    """Non-differentiable spectral-peak BPM for evaluation only."""
+    power, frequencies = normalized_power_spectrum(waveform.unsqueeze(0), fps)
+    return float(frequencies[int(power[0].argmax())] * 60.0)
+
+
 @torch.no_grad()
 def evaluate(model, dataset, device, total_epochs, checkpoint_epoch):
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2,
                         pin_memory=device.type == "cuda")
     values = {key: [] for key in (
-        "pearson", "waveform", "spectral", "kl", "bpm_mae",
+        "pearson", "waveform", "spectral", "kl",
+        "bpm_mae_peak_target", "bpm_mae_peak_hr_metadata",
         "video_l1", "baseline_l1", "delta_l1", "outside_skin_delta_l1",
     )}
     for batch in loader:
@@ -78,7 +86,15 @@ def evaluate(model, dataset, device, total_epochs, checkpoint_epoch):
         values["waveform"].append(float(physiology["waveform"]))
         values["spectral"].append(float(physiology["spectral"]))
         values["kl"].append(float(physiology["kl"]))
-        values["bpm_mae"].append(float(physiology["bpm"]))
+        fps = float(batch["fps"][0])
+        recovered_bpm = hard_peak_bpm(output["rppg_extracted"][0], fps)
+        target_bpm = hard_peak_bpm(batch["target_rppg"][0], fps)
+        values["bpm_mae_peak_target"].append(abs(recovered_bpm - target_bpm))
+        metadata_bpm = float(batch["target_bpm"][0])
+        if np.isfinite(metadata_bpm):
+            values["bpm_mae_peak_hr_metadata"].append(
+                abs(recovered_bpm - metadata_bpm)
+            )
         prediction = output["prediction"]
         baseline = output["prediction_base"]
         delta = output["physiology_delta"]
@@ -89,7 +105,10 @@ def evaluate(model, dataset, device, total_epochs, checkpoint_epoch):
         values["outside_skin_delta_l1"].append(
             float((delta.abs() * (1.0 - masks)).mean())
         )
-    return {key: float(np.mean(metric)) for key, metric in values.items()}
+    return {
+        key: (float(np.mean(metric)) if metric else None)
+        for key, metric in values.items()
+    }
 
 
 def main():

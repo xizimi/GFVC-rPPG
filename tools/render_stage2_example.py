@@ -117,12 +117,19 @@ def main():
     original = batch["original_rppg"][0].cpu().numpy()
     extracted = output["rppg_extracted"][0].cpu().numpy()
     fps = float(batch["fps"][0])
+    prefix = "%s_%s_%03d" % (args.mode, raw["name"].replace(".face.npy", ""), args.index)
+    # These frame-aligned arrays are the sole references for the independent
+    # pyVHR evaluation.  Store them beside the lossless streams rather than
+    # reconstructing them from a plot or relying on a dataset lookup later.
+    target_signal_path = os.path.join(args.output_dir, prefix + "_target_bvp.npy")
+    original_signal_path = os.path.join(args.output_dir, prefix + "_original_bvp.npy")
+    np.save(target_signal_path, target.astype(np.float32))
+    np.save(original_signal_path, original.astype(np.float32))
     correlation = float(np.corrcoef(standardize(target), standardize(extracted))[0, 1])
     physiology = physiological_losses(
         output["rppg_extracted"], batch["target_rppg"], batch["fps"],
         target_bpm=batch["target_bpm"],
     )
-    prefix = "%s_%s_%03d" % (args.mode, raw["name"].replace(".face.npy", ""), args.index)
     avi_path = os.path.join(args.output_dir, prefix + "_input_vs_recovered.avi")
     writer = cv2.VideoWriter(avi_path, cv2.VideoWriter_fourcc(*"FFV1"), fps,
                              (input_video.shape[2] * 2, input_video.shape[1]))
@@ -135,6 +142,22 @@ def main():
         if i % 3 == 0:
             previews.append(Image.fromarray(frame))
     writer.release()
+
+    # Keep the side-by-side movie for visual inspection, but also store the two
+    # streams independently.  Classical rPPG methods must never be evaluated on
+    # the annotated/paneled visualization because its title bars alter the ROI.
+    input_avi_path = os.path.join(args.output_dir, prefix + "_input_only.avi")
+    recovered_avi_path = os.path.join(args.output_dir, prefix + "_recovered_only.avi")
+    for path, frames in ((input_avi_path, input_video),
+                         (recovered_avi_path, recovered_video)):
+        stream_writer = cv2.VideoWriter(
+            path, cv2.VideoWriter_fourcc(*"FFV1"), fps,
+            (frames.shape[2], frames.shape[1]))
+        if not stream_writer.isOpened():
+            raise RuntimeError("FFV1 writer unavailable; no lossy fallback is used")
+        for frame in frames:
+            stream_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        stream_writer.release()
     gif_path = os.path.join(args.output_dir, prefix + "_input_vs_recovered.gif")
     previews[0].save(gif_path, save_all=True, append_images=previews[1:],
                      duration=int(3000.0 / fps), loop=0)
@@ -162,7 +185,10 @@ def main():
         "sample": raw["name"], "mode": args.mode, "checkpoint_epoch": int(saved["epoch"]),
         "fps": fps, "target_vs_extracted_pearson": correlation,
         "target_bpm": peak_bpm(target, fps), "extracted_bpm": peak_bpm(extracted, fps),
-        "bpm_mae": float(physiology["bpm"]), "avi": avi_path,
+        "bpm_mae_peak_target": abs(peak_bpm(target, fps) - peak_bpm(extracted, fps)),
+        "bpm_mae_soft_training_only": float(physiology["bpm"]), "avi": avi_path,
+        "input_avi": input_avi_path, "recovered_avi": recovered_avi_path,
+        "target_signal": target_signal_path, "original_signal": original_signal_path,
         "gif": gif_path, "plot": plot_path,
     }
     with open(os.path.join(args.output_dir, prefix + "_metrics.json"), "w", encoding="utf-8") as handle:

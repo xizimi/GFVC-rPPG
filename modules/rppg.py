@@ -261,41 +261,91 @@ class TemporalRPPGEncoder(nn.Module):
 
 
 class SkinPhysiologyResidual(nn.Module):
-    """Produce a bounded RGB residual conditioned on the target waveform.
+    """Low-rank, BVP-driven skin colour modulation.
 
-    The last layer is zero initialized, so adding this module to a pretrained
-    GFVC generator initially leaves its output bit-for-bit unchanged (up to the
-    final clamp). Skin localization is learned from the masked training losses;
-    no mask is required in the receiver's transmitted input.
+    The main branch factorises the RGB residual into a predicted soft skin gate,
+    a small number of spatial response maps, and BVP-controlled RGB directions:
+    ``delta = mask * sum_k(response_k * colour_k(t))``.  It is intentionally
+    more constrained than a free per-pixel RGB residual.  ``free_residual`` is
+    optional and disabled by default for ablation only.
     """
 
-    def __init__(self, feature_channels, condition_dim=64, hidden_channels=64,
-                 max_delta=4.0 / 255.0):
+    def __init__(self, feature_channels=3, condition_dim=64, hidden_channels=64,
+                 max_delta=4.0 / 255.0, rank=2, free_residual_scale=0.0):
         super().__init__()
+        if feature_channels != 3:
+            raise ValueError('SkinPhysiologyResidual operates on RGB predictions')
+        if rank < 1:
+            raise ValueError('rank must be positive')
         self.max_delta = float(max_delta)
-        self.affine = nn.Linear(condition_dim, feature_channels * 2)
-        self.residual = nn.Sequential(
-            nn.Conv2d(feature_channels, hidden_channels, 3, padding=1),
+        self.rank = int(rank)
+        self.free_residual_scale = float(free_residual_scale)
+        self.spatial = nn.Sequential(
+            nn.Conv2d(3, hidden_channels, 3, padding=1),
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
             nn.SiLU(inplace=True),
+        )
+        # One predicted gate and K signed spatial physiology response maps.
+        self.skin_gate = nn.Conv2d(hidden_channels, 1, 1)
+        self.response_maps = nn.Conv2d(hidden_channels, self.rank, 1)
+        self.colour_direction = nn.Sequential(
+            nn.Linear(condition_dim, hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_channels, self.rank * 3),
+        )
+        self.amplitude = nn.Sequential(
+            nn.Linear(condition_dim, hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_channels, self.rank),
+        )
+        self.free_residual = nn.Sequential(
+            nn.Conv2d(3, hidden_channels, 3, padding=1),
+            nn.SiLU(inplace=True),
             nn.Conv2d(hidden_channels, 3, 1),
         )
-        nn.init.zeros_(self.affine.weight)
-        nn.init.zeros_(self.affine.bias)
-        nn.init.zeros_(self.residual[-1].weight)
-        nn.init.zeros_(self.residual[-1].bias)
+        # Keep the initial modulation imperceptibly small, but not exactly zero:
+        # an all-zero colour head blocks useful first-step gradients to the
+        # spatial response maps and can leave the physiological branch dormant.
+        nn.init.normal_(self.colour_direction[-1].weight, mean=0.0, std=2e-2)
+        nn.init.zeros_(self.colour_direction[-1].bias)
+        nn.init.zeros_(self.amplitude[-1].weight)
+        nn.init.zeros_(self.amplitude[-1].bias)
+        nn.init.zeros_(self.free_residual[-1].weight)
+        nn.init.zeros_(self.free_residual[-1].bias)
 
-    def forward(self, feature, condition):
+    def forward(self, base_prediction, condition, physiology_value):
+        if base_prediction.dim() != 4 or base_prediction.shape[1] != 3:
+            raise ValueError('base_prediction must have shape (B, 3, H, W)')
         if condition.dim() != 2:
-            raise ValueError("condition must have shape (B, D)")
-        gamma, beta = self.affine(condition).chunk(2, dim=1)
-        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
-        beta = beta.unsqueeze(-1).unsqueeze(-1)
-        conditioned = feature * (1.0 + gamma) + beta
-        delta = self.max_delta * torch.tanh(self.residual(conditioned))
+            raise ValueError('condition must have shape (B, D)')
+        if physiology_value.dim() == 1:
+            physiology_value = physiology_value.unsqueeze(1)
+        if physiology_value.shape != (base_prediction.shape[0], 1):
+            raise ValueError('physiology_value must have shape (B,) or (B, 1)')
 
-        return delta
+        features = self.spatial(base_prediction)
+        skin_mask = torch.sigmoid(self.skin_gate(features))
+        response = torch.tanh(self.response_maps(features))
+        colours = torch.tanh(self.colour_direction(condition)).view(
+            base_prediction.shape[0], self.rank, 3, 1, 1
+        )
+        # Directly gate the temporal modulation by the target BVP sample while
+        # allowing the complete-waveform encoder to make small rank-wise gains.
+        gains = 1.0 + 0.25 * torch.tanh(self.amplitude(condition))
+        temporal = torch.tanh(physiology_value).view(-1, 1, 1, 1, 1)
+        modulation = (response.unsqueeze(2) * colours *
+                      gains.view(-1, self.rank, 1, 1, 1) * temporal).sum(dim=1)
+        delta = self.max_delta * torch.tanh(skin_mask * modulation)
+        if self.free_residual_scale > 0:
+            delta = delta + self.free_residual_scale * self.max_delta * torch.tanh(
+                self.free_residual(base_prediction)
+            )
+        return {
+            'delta': delta,
+            'skin_mask': skin_mask,
+            'response_maps': response,
+        }
 
 
 def negative_pearson_loss(pred, target, eps=1e-8):

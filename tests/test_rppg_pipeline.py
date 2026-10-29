@@ -6,7 +6,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from modules.rppg import RePPGTeacherAdapter, SkinRPPGTeacher, physiological_losses
+from modules.rppg import (RePPGTeacherAdapter, SkinPhysiologyResidual,
+                          SkinRPPGTeacher, physiological_losses)
 from rppg_gfvc_dataset import GFVCRPPGWindowDataset
 from train_gfvc_rppg import teacher_preflight
 
@@ -28,6 +29,21 @@ class _FakeTeacher(nn.Module):
 
 
 class RPPGPipelineTests(unittest.TestCase):
+    def test_physiology_modulation_is_bounded_and_has_mask_gradient(self):
+        module = SkinPhysiologyResidual(condition_dim=8, hidden_channels=8, rank=2)
+        base = torch.rand(2, 3, 16, 16, requires_grad=True)
+        condition = torch.rand(2, 8, requires_grad=True)
+        values = torch.tensor([0.5, -0.5])
+        output = module(base, condition, values)
+        self.assertEqual(tuple(output['delta'].shape), (2, 3, 16, 16))
+        self.assertEqual(tuple(output['skin_mask'].shape), (2, 1, 16, 16))
+        self.assertTrue(torch.all(output['skin_mask'] >= 0))
+        self.assertTrue(torch.all(output['skin_mask'] <= 1))
+        self.assertGreater(float(output['delta'].abs().max()), 0.0)
+        self.assertLessEqual(float(output['delta'].abs().max()), module.max_delta + 1e-7)
+        (output['delta'].square().mean() + output['skin_mask'].mean()).backward()
+        self.assertTrue(torch.isfinite(base.grad).all())
+
     def test_skin_teacher_has_full_waveform_gradient(self):
         teacher = SkinRPPGTeacher(channels=8, temporal_channels=32, gru_hidden=16)
         video = torch.rand(1, 9, 3, 32, 32, requires_grad=True)

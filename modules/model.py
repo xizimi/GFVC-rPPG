@@ -485,7 +485,7 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian)
         encoded_rppg = self.generator.physiology_encoder(target)
 
-        predictions, baselines, deltas = [], [], []
+        predictions, baselines, deltas, predicted_skin_masks = [], [], [], []
         for frame_index in range(time):
             he_driving = self.he_estimator(driving[:, frame_index])
             kp_driving = keypoint_transformation(
@@ -494,14 +494,17 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
             generated = self.generator(
                 source, kp_source=kp_source, kp_driving=kp_driving,
                 physiology_condition=encoded_rppg[:, frame_index],
+                physiology_value=target[:, frame_index],
             )
             predictions.append(generated['prediction'])
             baselines.append(generated['prediction_base'])
             deltas.append(generated['physiology_delta'])
+            predicted_skin_masks.append(generated['physiology_skin_mask'])
 
         prediction = torch.stack(predictions, dim=1)
         baseline = torch.stack(baselines, dim=1)
         delta = torch.stack(deltas, dim=1)
+        predicted_skin_mask = torch.stack(predicted_skin_masks, dim=1)
         masked_prediction = prediction * masks
         extracted = self.rppg_extractor(masked_prediction)
 
@@ -521,6 +524,8 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
             'visual_preservation': self.loss_weights['visual'] * F.l1_loss(prediction, baseline),
             'outside_skin': self.loss_weights['outside_skin'] *
                 (delta.abs() * (1.0 - masks)).mean(),
+            'skin_mask': self.loss_weights.get('skin_mask', 0.0) *
+                F.binary_cross_entropy(predicted_skin_mask, masks),
             'physiology_residual': self.loss_weights['residual'] * delta.abs().mean(),
         }
         if time >= 3:
@@ -532,6 +537,7 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
             'prediction': prediction,
             'prediction_base': baseline,
             'physiology_delta': delta,
+            'physiology_skin_mask': predicted_skin_mask,
             'rppg_extracted': extracted,
         }
         return losses, output
