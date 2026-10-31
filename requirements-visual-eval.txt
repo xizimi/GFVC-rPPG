@@ -1,0 +1,6 @@
+# Visual evaluation only. Keep this separate from the legacy training runtime.
+numpy
+opencv-python
+torch
+torchvision
+pyiqa
