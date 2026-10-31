@@ -86,10 +86,53 @@ def make_windows(n_frames, window_size, step_size):
     while start + window_size <= n_frames:
         windows.append((start, start + window_size))
         start += step_size
-    if not windows and n_frames >= window_size // 2:
-        # keep one shorter final clip so tiny subjects are not lost
-        windows.append((0, n_frames))
     return windows
+
+
+def load_split_map(path):
+    """Return subject -> split and reject identity leakage."""
+    if path is None:
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    mapping = {}
+    for split in ("train", "val", "test"):
+        if split not in data or not isinstance(data[split], list):
+            raise ValueError("splits JSON must contain train/val/test lists")
+        for subject in data[split]:
+            if subject in mapping:
+                raise ValueError("subject appears in multiple splits: %s" % subject)
+            mapping[subject] = split
+    return mapping
+
+
+def prepare_subject_output(subject_out, overwrite):
+    """Prepare one narrowly scoped subject directory without stale windows."""
+    subject_out = Path(subject_out)
+    meta_path = subject_out / "meta.json"
+    if not subject_out.exists():
+        subject_out.mkdir(parents=True)
+        return meta_path, None
+    entries = list(subject_out.iterdir())
+    if not entries:
+        return meta_path, None
+    if not overwrite:
+        if meta_path.exists():
+            with meta_path.open(encoding="utf-8") as handle:
+                return meta_path, json.load(handle)
+        raise RuntimeError("partial output directory exists; use a new root or --overwrite: %s" %
+                           subject_out)
+    allowed_suffixes = (".face.npy", ".sig.npy", ".skin.npy")
+    unexpected = [path for path in entries
+                  if path.is_dir() or not (path.name == "meta.json" or
+                                            (path.name.startswith("clip_") and
+                                             path.name.endswith(allowed_suffixes)))]
+    if unexpected:
+        raise RuntimeError("refusing to clean unexpected subject outputs: %s" %
+                           ", ".join(str(path) for path in unexpected))
+    for path in entries:
+        path.unlink()
+    return meta_path, None
 
 
 def process_subject(
@@ -99,6 +142,9 @@ def process_subject(
     window_size,
     step_size,
     size,
+    split=None,
+    target_offset=0,
+    target_frames=None,
     overwrite=False,
 ):
     video_path = os.path.join(subject_dir, "vid.avi")
@@ -129,12 +175,10 @@ def process_subject(
 
     subject_name = os.path.basename(subject_dir)
     subject_out = os.path.join(out_dir, subject_name)
-    os.makedirs(subject_out, exist_ok=True)
-    meta_path = os.path.join(subject_out, "meta.json")
-    if not overwrite and os.path.exists(meta_path):
+    meta_path, existing_meta = prepare_subject_output(subject_out, overwrite)
+    if existing_meta is not None:
         cap.release()
-        with open(meta_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return existing_meta
 
     window_bounds = make_windows(n, window_size, step_size)
     if not window_bounds:
@@ -169,6 +213,8 @@ def process_subject(
             "hr": hr[start : start + written],
             "time": time[start : start + written],
             "fps": float(fps),
+            "target_offset": int(target_offset),
+            "target_frames": int(target_frames or written),
         }
         np.save(sig_path, window_sig, allow_pickle=True)
         windows.append(
@@ -179,6 +225,12 @@ def process_subject(
                 "end": int(start + written),
                 "frames": int(written),
                 "fps": float(fps),
+                "duration_seconds": float(written / fps),
+                "target_offset": int(target_offset),
+                "target_frames": int(target_frames or written),
+                "target_start": int(start + target_offset),
+                "target_end": int(start + target_offset +
+                                  (target_frames or written)),
             }
         )
 
@@ -196,12 +248,13 @@ def process_subject(
         "n_windows": int(len(windows)),
         "window_size": int(window_size),
         "step_size": int(step_size),
+        "split": split,
         "crop_size": int(size),
         "bbox": [int(v) for v in bbox],
         "fixed_crop_box_xyxy": [int(v) for v in crop_box],
         "windows": windows,
     }
-    with open(meta_path, "w", encoding="utf-8") as f:
+    with open(str(meta_path), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     return meta
@@ -214,9 +267,25 @@ def main():
     parser.add_argument("--subjects", default="*", help="subject name or glob")
     parser.add_argument("--window_size", type=int, default=150)
     parser.add_argument("--step_size", type=int, default=75)
+    parser.add_argument("--splits", default=None,
+                        help="Subject split JSON; enables 150-frame train/val and 360-frame test")
+    parser.add_argument("--train_window_size", type=int, default=150)
+    parser.add_argument("--train_step_size", type=int, default=75)
+    parser.add_argument("--test_window_size", type=int, default=360)
+    parser.add_argument("--test_step_size", type=int, default=360)
+    parser.add_argument("--chrom_context_mode", action="store_true",
+                        help="Write 60+360+60 frame CHROM candidates before final slicing")
+    parser.add_argument("--context_frames", type=int, default=60)
+    parser.add_argument("--target_frames", type=int, default=360)
     parser.add_argument("--size", type=int, default=256)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    split_map = load_split_map(args.splits)
+    lengths = (args.window_size, args.step_size, args.train_window_size,
+               args.train_step_size, args.test_window_size, args.test_step_size,
+               args.context_frames, args.target_frames)
+    if any(value <= 0 for value in lengths):
+        parser.error("all window and step sizes must be positive")
 
     detector = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -226,14 +295,38 @@ def main():
     for subject_dir in subject_dirs:
         if not os.path.isdir(subject_dir):
             continue
-        print(f"Processing {subject_dir}")
+        subject = os.path.basename(subject_dir)
+        split = split_map.get(subject)
+        if split_map and split is None:
+            print("Skipping unassigned subject %s" % subject)
+            continue
+        target_offset, target_frames = 0, None
+        if args.chrom_context_mode:
+            if not split_map:
+                parser.error("--chrom_context_mode requires --splits")
+            target_offset = args.context_frames
+            target_frames = args.target_frames
+            window_size = args.target_frames + 2 * args.context_frames
+            step_size = args.target_frames
+        elif split == "test":
+            window_size, step_size = args.test_window_size, args.test_step_size
+        elif split in ("train", "val"):
+            window_size, step_size = args.train_window_size, args.train_step_size
+        else:
+            window_size, step_size = args.window_size, args.step_size
+        destination = os.path.join(args.out, split) if split else args.out
+        print("Processing %s split=%s frames=%d step=%d" %
+              (subject_dir, split or "unspecified", window_size, step_size))
         meta = process_subject(
             subject_dir,
-            args.out,
+            destination,
             detector,
-            args.window_size,
-            args.step_size,
+            window_size,
+            step_size,
             args.size,
+            split=split,
+            target_offset=target_offset,
+            target_frames=target_frames,
             overwrite=args.overwrite,
         )
         if meta is None:
