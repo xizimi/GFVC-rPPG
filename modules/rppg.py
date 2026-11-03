@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import importlib.util
 import sys
+from modules.physiology_motion import MotionAlignedPhysioModulator
 
 
 class RPPGEncoder(nn.Module):
@@ -304,9 +305,8 @@ class SkinPhysiologyResidual(nn.Module):
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_channels, 3, 1),
         )
-        # Keep the initial modulation imperceptibly small, but not exactly zero:
-        # an all-zero colour head blocks useful first-step gradients to the
-        # spatial response maps and can leave the physiological branch dormant.
+        # The initial model is exactly the frozen GFVC output. Gradients first
+        # open the colour/amplitude heads, then train spatial response maps.
         nn.init.normal_(self.colour_direction[-1].weight, mean=0.0, std=2e-2)
         nn.init.zeros_(self.colour_direction[-1].bias)
         nn.init.zeros_(self.amplitude[-1].weight)

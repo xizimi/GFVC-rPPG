@@ -20,36 +20,32 @@ from rppg_gfvc_dataset import GFVCRPPGWindowDataset
 
 
 def load_component_checkpoint(path, generator, kp_detector, he_estimator):
+    from modules.physiology_motion import load_generator_compatible
     checkpoint = torch.load(path, map_location='cpu')
-    for key, module in [('generator', generator), ('kp_detector', kp_detector),
-                        ('he_estimator', he_estimator)]:
+    for key, module in [('generator',generator),('kp_detector',kp_detector),('he_estimator',he_estimator)]:
         if key not in checkpoint:
-            raise KeyError('%s is missing component %s' % (path, key))
-        missing, unexpected = module.load_state_dict(checkpoint[key], strict=False)
-        # New physiology layers are intentionally absent from legacy checkpoints.
-        allowed_new = ('physiology', 'rppg_fusion')
-        unexpected = [name for name in unexpected if not name.startswith(allowed_new)]
-        missing = [name for name in missing if not name.startswith(allowed_new)]
-        if missing or unexpected:
-            raise RuntimeError(
-                '%s checkpoint architecture mismatch: missing=%s unexpected=%s' %
-                (key, missing, unexpected)
-            )
+            raise KeyError('%s is missing component %s' % (path,key))
+        if key == 'generator':
+            load_generator_compatible(module,checkpoint[key])
+        else:
+            module.load_state_dict(checkpoint[key],strict=True)
 
 
-def set_stage2_trainable(generator, kp_detector, he_estimator):
-    for module in (generator, kp_detector, he_estimator):
-        for parameter in module.parameters():
-            parameter.requires_grad_(False)
-        module.eval()
-    trainable = []
-    for name, parameter in generator.named_parameters():
-        if name.startswith('physiology_encoder.') or name.startswith('physiology_residual.'):
-            parameter.requires_grad_(True)
-            trainable.append(parameter)
-    if not trainable:
-        raise RuntimeError('No physiology parameters were selected for training')
-    return trainable
+def set_stage2_trainable(generator, kp_detector, he_estimator, training_stage='physiology'):
+    for module in (generator,kp_detector,he_estimator):
+        module.requires_grad_(False).eval()
+    mode = getattr(generator,'physiology_fusion_mode','rgb_residual')
+    prefixes = ('physiology_encoder.',)
+    prefixes += ('physiology_modulator.',) if mode.startswith('feature_') else ('physiology_residual.',)
+    if training_stage == 'joint_up1':
+        if not mode.startswith('feature_'):
+            raise ValueError('joint_up1 is reserved for feature-mode controlled experiments')
+        prefixes += ('decoder.up_1.',)
+    if mode == 'none':
+        return []
+    for name,parameter in generator.named_parameters():
+        parameter.requires_grad_(name.startswith(prefixes))
+    return [p for p in generator.parameters() if p.requires_grad]
 
 
 def move_batch(batch, device):
@@ -147,6 +143,14 @@ def main():
     parser.add_argument('--resume', default=None)
     parser.add_argument('--require_semantic_masks', action='store_true')
     parser.add_argument('--allow_fallback_masks', action='store_true')
+    parser.add_argument('--physiology_fusion_mode', choices=['rgb_residual','feature_unaligned','feature_motion_aligned','none'], default='rgb_residual')
+    parser.add_argument('--physiology_rank', type=int, default=2)
+    parser.add_argument('--training_stage', choices=['physiology','joint_up1'], default='physiology')
+    parser.add_argument('--spade_lr', type=float, default=1e-5)
+    parser.add_argument('--checkpoint_decoder', action='store_true')
+    parser.add_argument('--contact_clip_root', default=None, help='Existing subject-separated native clip dataset; does not alter preprocessing')
+    parser.add_argument('--patience', type=int, default=8)
+    parser.add_argument('--smoke_steps', type=int, default=0)
     args = parser.parse_args()
     if args.max_val_batches < 1:
         parser.error('--max_val_batches must be at least 1')
@@ -160,6 +164,14 @@ def main():
 
     with open(args.config, encoding='utf-8') as handle:
         config = yaml.safe_load(handle)
+    config['model_params']['generator_params'].setdefault('physiology_params', {})
+    config['model_params']['generator_params']['physiology_params'].update(
+        fusion_mode=args.physiology_fusion_mode, rank=args.physiology_rank)
+    if args.contact_clip_root is not None:
+        from tools.motion_physio.train_native import main_from_args
+        return main_from_args(args,config)
+    if args.generator != 'spade' and args.physiology_fusion_mode != 'rgb_residual':
+        raise ValueError('Feature/none ablations require --generator spade')
     common = config['model_params']['common_params']
     generator_class = (OcclusionAwareSPADEGenerator if args.generator == 'spade'
                        else OcclusionAwareGenerator)
@@ -191,18 +203,27 @@ def main():
             rppg_state = rppg_state['model']
         rppg_extractor.load_state_dict(rppg_state)
 
-    trainable = set_stage2_trainable(generator, kp_detector, he_estimator)
+    trainable = set_stage2_trainable(generator, kp_detector, he_estimator, args.training_stage)
+    generator.checkpoint_decoder = args.checkpoint_decoder
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     model = GFVCRPPGSequenceModel(
         kp_detector, he_estimator, generator, rppg_extractor,
         loss_weights=config['train_params'].get('physiology_loss_weights'),
         estimate_jacobian=common['estimate_jacobian'],
     ).to(device)
-    optimizer = torch.optim.Adam(trainable, lr=args.lr, betas=(0.5, 0.999))
+    if not trainable:
+        raise ValueError('none is a frozen inference/validation baseline, with no trainable physiology parameters')
+    groups = [{'params':[p for n,p in generator.named_parameters() if p.requires_grad and not n.startswith('decoder.')],'lr':args.lr}]
+    decoder_params = [p for n,p in generator.named_parameters() if p.requires_grad and n.startswith('decoder.')]
+    if decoder_params:
+        groups.append({'params':decoder_params,'lr':args.spade_lr})
+    optimizer = torch.optim.Adam(groups,betas=(0.5,0.999))
     start_epoch, best_val = 0, float('inf')
     if args.resume:
         saved = torch.load(args.resume, map_location='cpu')
-        generator.load_state_dict(saved['generator'], strict=True)
+        from modules.physiology_motion import load_generator_compatible
+        mode = saved.get('args',{}).get('physiology_fusion_mode','rgb_residual')
+        load_generator_compatible(generator,saved['generator'],declared_mode=mode)
         optimizer.load_state_dict(saved['optimizer'])
         start_epoch = int(saved['epoch'])
         best_val = float(saved.get('best_val', float('inf')))

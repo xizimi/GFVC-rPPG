@@ -147,17 +147,17 @@ def get_rotation_matrix(yaw, pitch, roll):
     pitch = pitch.unsqueeze(1)
     yaw = yaw.unsqueeze(1)
 
-    roll_mat = torch.cat([torch.ones_like(roll), torch.zeros_like(roll), torch.zeros_like(roll), 
+    roll_mat = torch.cat([torch.ones_like(roll), torch.zeros_like(roll), torch.zeros_like(roll),
                           torch.zeros_like(roll), torch.cos(roll), -torch.sin(roll),
                           torch.zeros_like(roll), torch.sin(roll), torch.cos(roll)], dim=1)
     roll_mat = roll_mat.view(roll_mat.shape[0], 3, 3)
 
-    pitch_mat = torch.cat([torch.cos(pitch), torch.zeros_like(pitch), torch.sin(pitch), 
+    pitch_mat = torch.cat([torch.cos(pitch), torch.zeros_like(pitch), torch.sin(pitch),
                            torch.zeros_like(pitch), torch.ones_like(pitch), torch.zeros_like(pitch),
                            -torch.sin(pitch), torch.zeros_like(pitch), torch.cos(pitch)], dim=1)
     pitch_mat = pitch_mat.view(pitch_mat.shape[0], 3, 3)
 
-    yaw_mat = torch.cat([torch.cos(yaw), -torch.sin(yaw), torch.zeros_like(yaw),  
+    yaw_mat = torch.cat([torch.cos(yaw), -torch.sin(yaw), torch.zeros_like(yaw),
                          torch.sin(yaw), torch.cos(yaw), torch.zeros_like(yaw),
                          torch.zeros_like(yaw), torch.zeros_like(yaw), torch.ones_like(yaw)], dim=1)
     yaw_mat = yaw_mat.view(yaw_mat.shape[0], 3, 3)
@@ -176,17 +176,17 @@ def get_rotation_matrix(yaw, pitch, roll):
     pitch = pitch.unsqueeze(1)
     yaw = yaw.unsqueeze(1)
 
-    pitch_mat = torch.cat([torch.ones_like(pitch), torch.zeros_like(pitch), torch.zeros_like(pitch), 
+    pitch_mat = torch.cat([torch.ones_like(pitch), torch.zeros_like(pitch), torch.zeros_like(pitch),
                           torch.zeros_like(pitch), torch.cos(pitch), -torch.sin(pitch),
                           torch.zeros_like(pitch), torch.sin(pitch), torch.cos(pitch)], dim=1)
     pitch_mat = pitch_mat.view(pitch_mat.shape[0], 3, 3)
 
-    yaw_mat = torch.cat([torch.cos(yaw), torch.zeros_like(yaw), torch.sin(yaw), 
+    yaw_mat = torch.cat([torch.cos(yaw), torch.zeros_like(yaw), torch.sin(yaw),
                            torch.zeros_like(yaw), torch.ones_like(yaw), torch.zeros_like(yaw),
                            -torch.sin(yaw), torch.zeros_like(yaw), torch.cos(yaw)], dim=1)
     yaw_mat = yaw_mat.view(yaw_mat.shape[0], 3, 3)
 
-    roll_mat = torch.cat([torch.cos(roll), -torch.sin(roll), torch.zeros_like(roll),  
+    roll_mat = torch.cat([torch.cos(roll), -torch.sin(roll), torch.zeros_like(roll),
                          torch.sin(roll), torch.cos(roll), torch.zeros_like(roll),
                          torch.zeros_like(roll), torch.zeros_like(roll), torch.ones_like(roll)], dim=1)
     roll_mat = roll_mat.view(roll_mat.shape[0], 3, 3)
@@ -199,13 +199,13 @@ def keypoint_transformation(kp_canonical, he, estimate_jacobian=True):
     kp = kp_canonical['value']    # (bs, k, 3)
     yaw, pitch, roll = he['yaw'], he['pitch'], he['roll']
     t, exp = he['t'], he['exp']
-    
+
     yaw = headpose_pred_to_degree(yaw)
     pitch = headpose_pred_to_degree(pitch)
     roll = headpose_pred_to_degree(roll)
 
     rot_mat = get_rotation_matrix(yaw, pitch, roll)    # (bs, 3, 3)
-    
+
     # keypoint rotation
     kp_rotated = torch.einsum('bmp,bkp->bkm', rot_mat, kp)
 
@@ -213,7 +213,7 @@ def keypoint_transformation(kp_canonical, he, estimate_jacobian=True):
     t = t.unsqueeze_(1).repeat(1, kp.shape[1], 1)
     kp_t = kp_rotated + t
 
-    # add expression deviation 
+    # add expression deviation
     exp = exp.view(exp.shape[0], -1, 3)
     kp_transformed = kp_t + exp
 
@@ -263,7 +263,7 @@ class GeneratorFullModel(torch.nn.Module):
 
 
     def forward(self, x):
-        kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian}   
+        kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian}
 
         he_source = self.he_estimator(x['source'])        # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
         he_driving = self.he_estimator(x['driving'])      # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
@@ -354,7 +354,7 @@ class GeneratorFullModel(torch.nn.Module):
                 transformed_jacobian_2d = transformed_kp['jacobian'][:, :, :2, :2]
                 jacobian_transformed = torch.matmul(transform.jacobian(transformed_kp_2d),
                                                     transformed_jacobian_2d)
-                
+
                 jacobian_2d = kp_driving['jacobian'][:, :, :2, :2]
                 normed_driving = torch.inverse(jacobian_2d)
                 normed_transformed = jacobian_transformed
@@ -381,7 +381,7 @@ class GeneratorFullModel(torch.nn.Module):
                 for j in range(kp_driving['value'].shape[1]):
                     dist = F.pairwise_distance(kp_driving['value'][:, i, :], kp_driving['value'][:, j, :], p=2, keepdim=True) ** 2
                     dist = 0.1 - dist      # set Dt = 0.1
-                    dd = torch.gt(dist, 0) 
+                    dd = torch.gt(dist, 0)
                     value = (dist * dd).mean()
                     value_total += value
 
@@ -459,6 +459,8 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
         self.generator.eval()
         self.generator.physiology_encoder.train(mode)
         self.generator.physiology_residual.train(mode)
+        if hasattr(self.generator, 'physiology_modulator'):
+            self.generator.physiology_modulator.train(mode)
         # Most frozen teachers stay in eval mode. SkinRPPGTeacher is a
         # GroupNorm/no-dropout model with a cuDNN GRU; cuDNN requires training
         # mode to backpropagate from its output to the generated input frames.
@@ -484,8 +486,12 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
         he_source = self.he_estimator(source)
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian)
         encoded_rppg = self.generator.physiology_encoder(target)
+        reference_context = (self.generator.prepare_reference(source)
+                             if hasattr(self.generator, 'prepare_reference') else None)
 
-        predictions, baselines, deltas, predicted_skin_masks = [], [], [], []
+        predictions, baselines, deltas = [], [], []
+        predicted_skin_masks, physiology_response_maps = [], []
+        feature_norms, physiology_gates = [], []
         for frame_index in range(time):
             he_driving = self.he_estimator(driving[:, frame_index])
             kp_driving = keypoint_transformation(
@@ -495,16 +501,24 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
                 source, kp_source=kp_source, kp_driving=kp_driving,
                 physiology_condition=encoded_rppg[:, frame_index],
                 physiology_value=target[:, frame_index],
+                **({'reference_context': reference_context} if reference_context is not None else {}),
+                **({'prediction_base_override': batch['frozen_base_video'][:, frame_index]}
+                   if 'frozen_base_video' in batch and reference_context is not None else {}),
             )
             predictions.append(generated['prediction'])
             baselines.append(generated['prediction_base'])
             deltas.append(generated['physiology_delta'])
             predicted_skin_masks.append(generated['physiology_skin_mask'])
+            physiology_response_maps.append(generated['physiology_response_maps'])
+            if 'physiology_feature_norm' in generated:
+                feature_norms.append(generated['physiology_feature_norm'])
+                physiology_gates.append(generated['physiology_gate'])
 
         prediction = torch.stack(predictions, dim=1)
         baseline = torch.stack(baselines, dim=1)
         delta = torch.stack(deltas, dim=1)
         predicted_skin_mask = torch.stack(predicted_skin_masks, dim=1)
+        response_maps = torch.stack(physiology_response_maps, dim=1)
         masked_prediction = prediction * masks
         extracted = self.rppg_extractor(masked_prediction)
 
@@ -538,8 +552,12 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
             'prediction_base': baseline,
             'physiology_delta': delta,
             'physiology_skin_mask': predicted_skin_mask,
+            'physiology_response_maps': response_maps,
             'rppg_extracted': extracted,
         }
+        if feature_norms:
+            output['physiology_feature_norm'] = torch.stack(feature_norms, dim=1)
+            output['physiology_gate'] = torch.stack(physiology_gates, dim=1)
         return losses, output
 
 
