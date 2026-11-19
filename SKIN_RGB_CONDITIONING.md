@@ -13,21 +13,26 @@ shape `[B,T,3,H,W]` and masks `[B,T,1,H,W]` in `[0,1]`. Empty masks raise a
 descriptive error. The sequence has shape `[B,T,3]` and preserves frame order.
 Each channel is centered and divided by its population standard deviation over
 the actual conditioning window, with a `1e-6` floor. Constant channels become zero.
-The encoder also projects all three original means and all three original standard
-deviations through a learned `Linear(6,64)` and adds the result to every temporal
-feature. These statistics retain the original color baseline and channel amplitudes.
+The encoder projects the three original channel standard deviations through a
+learned `Linear(3,64)` and adds the result to every temporal feature. The physiology
+condition retains channel amplitudes and is invariant to constant per-channel RGB
+offsets, up to floating-point precision. Average RGB stays outside this condition.
 Training and inference use the same preprocessing without filtering or resampling.
 
 The temporal encoder takes three channels and returns `[B,T,64]` features.
 The modulation head concatenates the temporal feature with the current
-raw RGB vector in `[0,1]`. A learned `Linear(3,1)` predicts its amplitude before
-`tanh`. This per-frame path receives unstandardized skin-area means.
+centered RGB vector `rgb(t) - mean(rgb)`. A learned `Linear(3,1,bias=False)`
+predicts its signed amplitude before `tanh`. Centering uses the actual input window
+and retains the original numerical amplitude and channel amplitude ratios. The
+modulation head receives this centered vector as well. A constant RGB window gives
+zero direct amplitude drive. Training and inference share `center_skin_rgb`.
 The reference basis, existing motion warp, skin/visibility gating and GFVC decoder
 continue to operate through the same feature modulation path.
 
 `GFVCRPPGSequenceModel` computes conditioning from `driving_video` and `skin_masks`.
-Its scalar `target_rppg` remains the supervision and metric reference, including
-when that field stores a prepared CHROM label. Set `--rewrite_probability 0` for
+Its scalar `target_rppg` remains the supervision and metric reference. The current
+experiment uses aligned contact PPG labels. This network change does not convert
+existing label files; the loader must supply the intended PPG source. Set `--rewrite_probability 0` for
 this experiment. RGB conditioning uses the driving clip's signal, so substituted
 scalar donor labels would mismatch its input. Validation uses the preserve set.
 
@@ -49,9 +54,13 @@ amplitude projection afresh.
 It checks the exact source schema and logs copied/initialized tensor names and
 checkpoint provenance. The optimizer starts fresh. Use `--resume` for a subsequent
 RGB checkpoint. BVP-to-RGB initialization requires fine-tuning before evaluation. The earlier RGB
-prototype checkpoint lacks the statistics projection; strict resume detects this
-schema difference. All scalar-BVP checkpoint tensors retain their original schema.
+prototype checkpoints have different statistics projections or an amplitude bias;
+strict resume detects these schema differences. All scalar-BVP checkpoint tensors retain their original schema.
 
 Regression checks run with
 `python -m unittest discover -s tests -p 'test_motion_physio.py'` and
 `python -m unittest discover -s tests -p 'test_skin_rgb_conditioning.py'`.
+
+Baseline-invariance tests hold the source features, motion and visibility fixed.
+Appearance features can still depend on the source image. Time-varying illumination
+and motion artifacts remain part of the measured RGB sequence.

@@ -19,7 +19,7 @@ def skin_rgb_means(video, masks):
 
 
 def skin_rgb_statistics(values):
-    """Return the physical-scale per-window channel means and deviations."""
+    """Return the original-scale per-window channel means and deviations."""
     if values.ndim != 3 or values.shape[-1] != 3 or values.shape[1] < 2:
         raise ValueError('skin RGB must have shape [B,T,3] with T >= 2')
     if not torch.isfinite(values).all():
@@ -32,3 +32,9 @@ def skin_rgb_statistics(values):
 def normalize_skin_rgb(values):
     mean, deviation = skin_rgb_statistics(values)
     return (values.float() - mean) / deviation.clamp_min(1e-6)
+
+
+def center_skin_rgb(values):
+    """Remove each channel's window baseline while retaining its amplitude."""
+    mean, _ = skin_rgb_statistics(values)
+    return values.float() - mean

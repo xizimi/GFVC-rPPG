@@ -19,7 +19,7 @@ class MotionAlignedPhysioModulator(nn.Module):
         if rank < 1 or depth < 1 or not 0 < initial_strength < 1 or max_feature_delta <= 0:
             raise ValueError('Invalid rank/depth/modulation strength')
         self.value_channels = value_channels
-        self.value_amplitude = nn.Linear(3, 1) if value_channels == 3 else None
+        self.value_amplitude = nn.Linear(3, 1, bias=False) if value_channels == 3 else None
         self.rank, self.depth = int(rank), int(depth)
         self.feature_channels = int(feature_channels)
         self.max_feature_delta = float(max_feature_delta)
@@ -87,7 +87,6 @@ def transfer_bvp_to_skin_rgb(generator, state):
     changed = {'physiology_encoder.input.weight',
                'physiology_modulator.modulation_head.0.weight'}
     fresh = {'physiology_modulator.value_amplitude.weight',
-             'physiology_modulator.value_amplitude.bias',
              'physiology_encoder.rgb_statistics.weight',
              'physiology_encoder.rgb_statistics.bias'}
     if set(state) != set(current) - fresh:

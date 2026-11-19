@@ -239,7 +239,7 @@ class TemporalRPPGEncoder(nn.Module):
         self.input_channels = input_channels
         self.input = nn.Conv1d(input_channels, hidden_dim, kernel_size=7, padding=3)
         if input_channels == 3:
-            self.rgb_statistics = nn.Linear(6, embedding_dim)
+            self.rgb_statistics = nn.Linear(3, embedding_dim)
         blocks = []
         for dilation in [2 ** i for i in range(num_blocks)]:
             padding = dilation * 2
@@ -256,12 +256,11 @@ class TemporalRPPGEncoder(nn.Module):
     def forward(self, waveform):
         if self.input_channels == 3:
             from modules.skin_rgb import normalize_skin_rgb, skin_rgb_statistics
-            mean, deviation = skin_rgb_statistics(waveform)
-            statistics = torch.cat((mean, deviation), dim=-1)
+            _, deviation = skin_rgb_statistics(waveform)
             x = F.silu(self.input(normalize_skin_rgb(waveform).transpose(1, 2)))
             for block in self.blocks:
                 x = x + block(x)
-            return self.output(x).transpose(1, 2) + self.rgb_statistics(statistics)
+            return self.output(x).transpose(1, 2) + self.rgb_statistics(deviation)
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
         if waveform.dim() != 2:

@@ -442,10 +442,11 @@ class OcclusionAwareSPADEGenerator(nn.Module):
     def forward_skin_rgb(self, source_image, kp_driving, kp_source, skin_rgb, frame_index,
                          reference_context=None):
         """Generate one frame from a complete raw [B,T,3] skin RGB window."""
+        from modules.skin_rgb import center_skin_rgb
         if self.physiology_input_mode != 'skin_rgb':
             raise ValueError('forward_skin_rgb requires input_mode=skin_rgb')
         condition = self._select_physiology_condition(self.physiology_encoder(skin_rgb), frame_index)
-        value = self._select_physiology_condition(skin_rgb.float(), frame_index)
+        value = self._select_physiology_condition(center_skin_rgb(skin_rgb), frame_index)
         return self.forward(source_image, kp_driving, kp_source,
                             physiology_condition=condition, physiology_value=value,
                             reference_context=reference_context)

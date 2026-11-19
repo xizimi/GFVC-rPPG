@@ -187,7 +187,7 @@ def main_from_args(args,config):
                    '0.5 mean complete28preserve +0.5 mean complete28rewrite12s validation total losses'),
         feature_basis='learned modulation basis, not validated blood-flow distribution',
         no_GT_mask_at_inference=args.physiology_input_mode != 'skin_rgb',
-        conditioning_preprocess=('raw mask-weighted RGB frame values; temporal zscore plus original channel means/std'
+        conditioning_preprocess=('centered RGB frame values; temporal zscore plus original channel std; bias-free amplitude'
                                 if args.physiology_input_mode == 'skin_rgb' else 'scalar BVP'),
         baseline_cache=str(CACHE),decoder_activation_recomputation=True,
         source_sha256={str(p.relative_to(PROJECT)):sha(p) for p in (
