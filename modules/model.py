@@ -485,7 +485,17 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
         kp_canonical = self.kp_extractor(source)
         he_source = self.he_estimator(source)
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian)
-        encoded_rppg = self.generator.physiology_encoder(target)
+        input_mode = getattr(self.generator, "physiology_input_mode", "bvp")
+        if input_mode == "skin_rgb":
+            from modules.skin_rgb import skin_rgb_means, normalize_skin_rgb
+            if "mode" in batch and (batch["mode"] != 0).any():
+                raise ValueError("skin_rgb driving conditioning requires same-clip supervision")
+            raw_rgb = skin_rgb_means(driving, masks)
+            encoded_rppg = self.generator.physiology_encoder(raw_rgb)
+            frame_values = normalize_skin_rgb(raw_rgb)
+        else:
+            encoded_rppg = self.generator.physiology_encoder(target)
+            frame_values = target
         reference_context = (self.generator.prepare_reference(source)
                              if hasattr(self.generator, 'prepare_reference') else None)
 
@@ -500,7 +510,7 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
             generated = self.generator(
                 source, kp_source=kp_source, kp_driving=kp_driving,
                 physiology_condition=encoded_rppg[:, frame_index],
-                physiology_value=target[:, frame_index],
+                physiology_value=frame_values[:, frame_index],
                 **({'reference_context': reference_context} if reference_context is not None else {}),
                 **({'prediction_base_override': batch['frozen_base_video'][:, frame_index]}
                    if 'frozen_base_video' in batch and reference_context is not None else {}),

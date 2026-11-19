@@ -30,6 +30,21 @@ def build(args,config,device):
     gen=OcclusionAwareSPADEGenerator(**mp['generator_params'],**common)
     kp=KPDetector(**mp['kp_detector_params'],**common);he=HEEstimator(**mp['he_estimator_params'],**common)
     load_component_checkpoint(args.gfvc_checkpoint,gen,kp,he)
+    if args.physiology_transfer_checkpoint:
+        from modules.physiology_motion import transfer_bvp_to_skin_rgb
+        if args.resume:
+            raise ValueError("Use transfer for initialization or resume for continuation")
+        transfer = torch.load(args.physiology_transfer_checkpoint, map_location="cpu")
+        report = transfer_bvp_to_skin_rgb(gen, transfer["generator"])
+        for key, module in (("kp_detector", kp), ("he_estimator", he)):
+            if key in transfer:
+                module.load_state_dict(transfer[key], strict=True)
+            else:
+                parent_base = transfer.get("run_config", {}).get("base_checkpoint", {})
+                if parent_base.get("sha256") != sha(args.gfvc_checkpoint):
+                    raise ValueError("Missing motion component without matching base provenance: " + key)
+        print("PHYSIOLOGY_TRANSFER", report, flush=True)
+        gen.physiology_transfer_report = report
     gen.checkpoint_decoder=True
     params=set_stage2_trainable(gen,kp,he,args.training_stage)
     if not params:raise ValueError('none is a frozen inference baseline; no training is required')
@@ -107,10 +122,11 @@ Frozen GFVC: {run['base_checkpoint']['path']} ({run['base_checkpoint']['sha256']
 Frozen teacher: {run['teacher_checkpoint']['path']} ({run['teacher_checkpoint']['sha256']}).
 Data: UBFC Train30subjects717native5s clips, Validation6subjects28fixed12s clips.
 LGI and Test videos never used for training/selection. No changes to processed data or splits.
-Conditioning: same-clip contact PPG or a Train-contact-PPG donor, probability {run['rewrite_probability']}.
+Conditioning mode: {run.get('physiology_input_mode', 'bvp')}. Rewrite probability {run['rewrite_probability']}.
 Preserve PPG stays aligned; rewrite uses donor timestamps on driving-relative timestamps, no phase search.
-Semantic masks are training supervision and diagnostic ROIs only, never generator inputs.
-Selection: equal mean of complete28preserve and28rewrite validation losses.
+Condition preprocessing: {run.get('conditioning_preprocess', 'scalar BVP')}.
+Skin RGB mode uses masks to calculate the encoder-side RGB sequence.
+Selection: {run['selection']}.
 Teacher is an unchanged measurement network. Green-waveform and image diagnostics are independent checks.
 Feature bases are learned modulation bases, not physically validated blood-flow maps.
 
@@ -143,7 +159,8 @@ def main_from_args(args,config):
     teacher_done=read(Path(args.rppg_checkpoint).parent/'TRAINING_COMPLETE.json')
     assert teacher_done['status']=='passed' and teacher_done['best_subject_mean_pearson']>=.2
     train=NativePhysioClips('train',args.rewrite_probability,args.seed)
-    preserve=NativePhysioClips('val',0.,args.seed);rewrite=NativePhysioClips('val',1.,args.seed)
+    preserve=NativePhysioClips('val',0.,args.seed)
+    rewrite=None if args.physiology_input_mode == 'skin_rgb' else NativePhysioClips('val',1.,args.seed)
     trainable={n:p.numel() for n,p in gen.named_parameters() if p.requires_grad}
     frozen={n:p.numel() for n,p in gen.named_parameters() if not p.requires_grad}
     assert all(n.startswith(('physiology_encoder.','physiology_modulator.','physiology_residual.','decoder.up_1.')) for n in trainable)
@@ -153,7 +170,12 @@ def main_from_args(args,config):
     run=dict(experiment_id=out.parent.name+'/'+out.name,fusion_mode=args.physiology_fusion_mode,rank=args.physiology_rank,
         training_stage=args.training_stage,provenance=provenance,architecture_config=config,runtime=runtime(),
         command_args=vars(args),command_line=sys.argv,
-        initialization=dict(kind='fresh physiology from original GFVC' if not args.resume else 'strict resume/declared parent',parent=args.resume),
+        physiology_input_mode=args.physiology_input_mode,
+        physiology_transfer=getattr(gen, 'physiology_transfer_report', None),
+        initialization=dict(kind=('BVP-to-skin-RGB transfer' if args.physiology_transfer_checkpoint else
+                                  'fresh physiology from original GFVC' if not args.resume else 'strict resume/declared parent'),
+                            parent=args.physiology_transfer_checkpoint or args.resume,
+                            parent_sha256=sha(args.physiology_transfer_checkpoint) if args.physiology_transfer_checkpoint else None),
         base_checkpoint=dict(path=str(Path(args.gfvc_checkpoint).resolve()),sha256=sha(args.gfvc_checkpoint)),
         teacher_checkpoint=dict(path=str(Path(args.rppg_checkpoint).resolve()),sha256=sha(args.rppg_checkpoint),validation=teacher_done),
         rewrite_probability=args.rewrite_probability,seed=args.seed,epochs=args.epochs,patience=args.patience,
@@ -161,17 +183,22 @@ def main_from_args(args,config):
         trainable_parameters=trainable,frozen_parameters=frozen,
         trainable_count=sum(trainable.values()),total_generator_count=sum(p.numel() for p in gen.parameters()),
         optimizer=dict(type='Adam',lr=args.lr,spade_lr=args.spade_lr,betas=[.5,.999],gradient_clip=1.),
-        selection='0.5 mean complete28preserve +0.5 mean complete28rewrite12s validation total losses',
+        selection=('mean preserve validation total loss' if args.physiology_input_mode == 'skin_rgb' else
+                   '0.5 mean complete28preserve +0.5 mean complete28rewrite12s validation total losses'),
         feature_basis='learned modulation basis, not validated blood-flow distribution',
-        no_GT_mask_at_inference=True,baseline_cache=str(CACHE),decoder_activation_recomputation=True,
+        no_GT_mask_at_inference=args.physiology_input_mode != 'skin_rgb',
+        conditioning_preprocess=('mask-weighted RGB means, per-window per-channel population zscore'
+                                if args.physiology_input_mode == 'skin_rgb' else 'scalar BVP'),
+        baseline_cache=str(CACHE),decoder_activation_recomputation=True,
         source_sha256={str(p.relative_to(PROJECT)):sha(p) for p in (
             PROJECT/'modules/generator.py',PROJECT/'modules/physiology_motion.py',PROJECT/'modules/rppg.py',
             PROJECT/'modules/model.py',PROJECT/'modules/dense_motion.py',PROJECT/'modules/util.py',
-            PROJECT/'train_gfvc_rppg.py',Path(__file__),
+            PROJECT/'train_gfvc_rppg.py',PROJECT/'modules/skin_rgb.py',Path(__file__),
             Path(__file__).with_name('data.py'),Path(__file__).with_name('diagnostics.py'))})
     start=1;best=float('inf');stale=0;global_step=0;history=[]
     if args.resume:
         state=torch.load(args.resume,map_location='cpu');old=state['run_config']
+        assert old.get('physiology_input_mode', 'bvp') == args.physiology_input_mode
         assert old['fusion_mode']==run['fusion_mode'] and old['rank']==run['rank']
         assert old['provenance']==provenance
         assert old['teacher_checkpoint']['sha256']==run['teacher_checkpoint']['sha256']
@@ -189,6 +216,7 @@ def main_from_args(args,config):
             run['initialization']=dict(kind='Stage2 from best frozen-decoder Stage1',parent=args.resume,sha256=sha(args.resume))
     if (out/'run_config.json').exists():
         old=read(out/'run_config.json')
+        assert old.get('physiology_input_mode', 'bvp') == args.physiology_input_mode
         for key in ('fusion_mode','training_stage','provenance','source_sha256','epochs','rewrite_probability'):
             assert old[key]==run[key],key
         assert old['teacher_checkpoint']['sha256']==run['teacher_checkpoint']['sha256']
@@ -229,8 +257,12 @@ def main_from_args(args,config):
                     max_cuda_bytes=torch.cuda.max_memory_allocated()))
             if args.smoke_steps and step>=args.smoke_steps:break
             del losses,output,loss,batch
-        val={name:validate(model,ds,device,args,epoch-1,bool(args.smoke_steps)) for name,ds in [('preserve',preserve),('rewrite',rewrite)]}
-        score=.5*(val['preserve']['mean']['total']+val['rewrite']['mean']['total']);assert np.isfinite(score)
+        validation_sets = [('preserve', preserve)]
+        if rewrite is not None:
+            validation_sets.append(('rewrite', rewrite))
+        val={name:validate(model,ds,device,args,epoch-1,bool(args.smoke_steps)) for name,ds in validation_sets}
+        score=float(np.mean([result['mean']['total'] for result in val.values()]))
+        assert np.isfinite(score)
         for n,v in gen.state_dict().items():
             if n in original_hash:assert hashlib.sha256(v.detach().cpu().numpy().tobytes()).hexdigest()==original_hash[n],n
         assert all(torch.equal(p,teacher_hash[n]) for n,p in model.rppg_extractor.named_parameters())

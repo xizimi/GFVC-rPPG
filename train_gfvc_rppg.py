@@ -144,6 +144,9 @@ def main():
     parser.add_argument('--require_semantic_masks', action='store_true')
     parser.add_argument('--allow_fallback_masks', action='store_true')
     parser.add_argument('--physiology_fusion_mode', choices=['rgb_residual','feature_unaligned','feature_motion_aligned','none'], default='rgb_residual')
+    parser.add_argument('--physiology_input_mode', choices=['bvp', 'skin_rgb'], default='bvp')
+    parser.add_argument('--physiology_transfer_checkpoint', default=None,
+                        help='Explicit BVP-to-RGB initialization checkpoint; optimizer starts fresh')
     parser.add_argument('--physiology_rank', type=int, default=2)
     parser.add_argument('--training_stage', choices=['physiology','joint_up1'], default='physiology')
     parser.add_argument('--spade_lr', type=float, default=1e-5)
@@ -166,7 +169,15 @@ def main():
         config = yaml.safe_load(handle)
     config['model_params']['generator_params'].setdefault('physiology_params', {})
     config['model_params']['generator_params']['physiology_params'].update(
-        fusion_mode=args.physiology_fusion_mode, rank=args.physiology_rank)
+        fusion_mode=args.physiology_fusion_mode, rank=args.physiology_rank,
+        input_mode=args.physiology_input_mode)
+    if args.physiology_input_mode == 'skin_rgb':
+        if args.generator != 'spade' or not args.physiology_fusion_mode.startswith('feature_'):
+            parser.error('skin_rgb requires SPADE feature fusion')
+        if args.rewrite_probability != 0:
+            parser.error('skin_rgb from driving frames requires --rewrite_probability 0')
+    if args.physiology_transfer_checkpoint and args.contact_clip_root is None:
+        parser.error('Explicit transfer is supported through --contact_clip_root')
     if args.contact_clip_root is not None:
         from tools.motion_physio.train_native import main_from_args
         return main_from_args(args,config)
@@ -243,7 +254,10 @@ def main():
     )
     validation_loaders = {}
     preserve_validation = None
-    for mode, probability in [('preserve', 0.0), ('rewrite', 1.0)]:
+    validation_modes = [('preserve', 0.0)]
+    if args.physiology_input_mode == 'bvp':
+        validation_modes.append(('rewrite', 1.0))
+    for mode, probability in validation_modes:
         validation = GFVCRPPGWindowDataset(
             args.val_data_root,
             sequence_length=args.sequence_length,
@@ -300,10 +314,7 @@ def main():
             mode: evaluate(model, val_loader, device, args.max_val_batches)
             for mode, val_loader in validation_loaders.items()
         }
-        val_score = 0.5 * (
-            validation_metrics['preserve']['total'] +
-            validation_metrics['rewrite']['total']
-        )
+        val_score = float(np.mean([metrics['total'] for metrics in validation_metrics.values()]))
         if not np.isfinite(val_score):
             raise FloatingPointError('Non-finite validation loss at epoch %d' % (epoch + 1))
         improved = val_score < best_val

@@ -270,11 +270,15 @@ class OcclusionAwareSPADEGenerator(nn.Module):
 
         self.decoder = SPADEDecoder()
         physiology_params = {} if physiology_params is None else physiology_params
+        self.physiology_input_mode = physiology_params.get('input_mode', 'bvp')
+        if self.physiology_input_mode not in ('bvp', 'skin_rgb'):
+            raise ValueError('Unknown physiology input mode')
         condition_dim = physiology_params.get('condition_dim', 64)
         self.physiology_encoder = TemporalRPPGEncoder(
             embedding_dim=condition_dim,
             hidden_dim=physiology_params.get('hidden_dim', 64),
             num_blocks=physiology_params.get('num_blocks', 4),
+            input_channels=3 if self.physiology_input_mode == 'skin_rgb' else 1,
         )
         # SPADEDecoder returns RGB directly, so its bounded physiology residual
         # is conditioned on the baseline RGB prediction.
@@ -291,6 +295,8 @@ class OcclusionAwareSPADEGenerator(nn.Module):
         self.physiology_fusion_mode = physiology_fusion_mode or physiology_params.get('fusion_mode', 'rgb_residual')
         if self.physiology_fusion_mode not in FUSION_MODES:
             raise ValueError('Unknown physiology fusion mode: ' + self.physiology_fusion_mode)
+        if self.physiology_input_mode == 'skin_rgb' and not self.physiology_fusion_mode.startswith('feature_'):
+            raise ValueError('skin_rgb requires feature physiology fusion')
         self.checkpoint_decoder = False
         if self.physiology_fusion_mode.startswith('feature_'):
             self.physiology_modulator = MotionAlignedPhysioModulator(
@@ -299,7 +305,8 @@ class OcclusionAwareSPADEGenerator(nn.Module):
                 rank=physiology_params.get('rank', 2),
                 hidden_channels=physiology_params.get('basis_channels', 16),
                 max_feature_delta=physiology_params.get('max_feature_delta', 0.1),
-                initial_strength=physiology_params.get('initial_feature_strength', 0.1))
+                initial_strength=physiology_params.get('initial_feature_strength', 0.1),
+                value_channels=3 if self.physiology_input_mode == 'skin_rgb' else 1)
 
     def deform_input(self, inp, deformation):
         # Explicit defaults preserve the pre-existing GFVC convention. Its
@@ -421,6 +428,8 @@ class OcclusionAwareSPADEGenerator(nn.Module):
                 baseline_decoder=None, prediction_base_override=None):
         # skin_mask is retained for call compatibility, intentionally never used
         # as a decoder input. It is supervised outside the generator only.
+        if self.physiology_input_mode == 'skin_rgb' and target_rppg is not None:
+            raise ValueError('Use forward_skin_rgb with an RGB sequence in skin_rgb mode')
         if physiology_condition is None and target_rppg is not None:
             physiology_condition = self._select_physiology_condition(
                 self.physiology_encoder(target_rppg),rppg_frame_index)
@@ -429,3 +438,15 @@ class OcclusionAwareSPADEGenerator(nn.Module):
                 target_rppg.unsqueeze(-1),rppg_frame_index).squeeze(-1)
         context = self.motion_context(source_image,kp_driving,kp_source,reference_context)
         return self.decode_context(context,physiology_condition,physiology_value,rppg_feat,baseline_decoder,prediction_base_override)
+
+    def forward_skin_rgb(self, source_image, kp_driving, kp_source, skin_rgb, frame_index,
+                         reference_context=None):
+        """Generate one frame from a complete raw [B,T,3] skin RGB window."""
+        from modules.skin_rgb import normalize_skin_rgb
+        if self.physiology_input_mode != 'skin_rgb':
+            raise ValueError('forward_skin_rgb requires input_mode=skin_rgb')
+        condition = self._select_physiology_condition(self.physiology_encoder(skin_rgb), frame_index)
+        value = self._select_physiology_condition(normalize_skin_rgb(skin_rgb), frame_index)
+        return self.forward(source_image, kp_driving, kp_source,
+                            physiology_condition=condition, physiology_value=value,
+                            reference_context=reference_context)
