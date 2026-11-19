@@ -487,12 +487,12 @@ class GFVCRPPGSequenceModel(torch.nn.Module):
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian)
         input_mode = getattr(self.generator, "physiology_input_mode", "bvp")
         if input_mode == "skin_rgb":
-            from modules.skin_rgb import skin_rgb_means, normalize_skin_rgb
+            from modules.skin_rgb import skin_rgb_means
             if "mode" in batch and (batch["mode"] != 0).any():
                 raise ValueError("skin_rgb driving conditioning requires same-clip supervision")
             raw_rgb = skin_rgb_means(driving, masks)
             encoded_rppg = self.generator.physiology_encoder(raw_rgb)
-            frame_values = normalize_skin_rgb(raw_rgb)
+            frame_values = raw_rgb
         else:
             encoded_rppg = self.generator.physiology_encoder(target)
             frame_values = target

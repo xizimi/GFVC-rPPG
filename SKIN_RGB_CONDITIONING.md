@@ -13,11 +13,15 @@ shape `[B,T,3,H,W]` and masks `[B,T,1,H,W]` in `[0,1]`. Empty masks raise a
 descriptive error. The sequence has shape `[B,T,3]` and preserves frame order.
 Each channel is centered and divided by its population standard deviation over
 the actual conditioning window, with a `1e-6` floor. Constant channels become zero.
+The encoder also projects all three original means and all three original standard
+deviations through a learned `Linear(6,64)` and adds the result to every temporal
+feature. These statistics retain the original color baseline and channel amplitudes.
 Training and inference use the same preprocessing without filtering or resampling.
 
 The temporal encoder takes three channels and returns `[B,T,64]` features.
-The modulation head concatenates the temporal feature with the current normalized
-RGB vector. A learned `Linear(3,1)` predicts its amplitude before `tanh`.
+The modulation head concatenates the temporal feature with the current
+raw RGB vector in `[0,1]`. A learned `Linear(3,1)` predicts its amplitude before
+`tanh`. This per-frame path receives unstandardized skin-area means.
 The reference basis, existing motion warp, skin/visibility gating and GFVC decoder
 continue to operate through the same feature modulation path.
 
@@ -40,10 +44,13 @@ The transfer copies every shape-compatible generator tensor, plus the checkpoint
 keypoint detector and head estimator when present. For native generator-only
 checkpoints, it verifies the original base-checkpoint SHA-256 and retains those
 frozen motion components from that base. It initializes the new three-channel encoder
-input, the widened modulation-head input and the amplitude projection afresh.
+input, the widened modulation-head input, the RGB statistics projection and the
+amplitude projection afresh.
 It checks the exact source schema and logs copied/initialized tensor names and
 checkpoint provenance. The optimizer starts fresh. Use `--resume` for a subsequent
-RGB checkpoint. BVP-to-RGB initialization requires fine-tuning before evaluation.
+RGB checkpoint. BVP-to-RGB initialization requires fine-tuning before evaluation. The earlier RGB
+prototype checkpoint lacks the statistics projection; strict resume detects this
+schema difference. All scalar-BVP checkpoint tensors retain their original schema.
 
 Regression checks run with
 `python -m unittest discover -s tests -p 'test_motion_physio.py'` and

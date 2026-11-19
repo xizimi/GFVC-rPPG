@@ -87,7 +87,9 @@ def transfer_bvp_to_skin_rgb(generator, state):
     changed = {'physiology_encoder.input.weight',
                'physiology_modulator.modulation_head.0.weight'}
     fresh = {'physiology_modulator.value_amplitude.weight',
-             'physiology_modulator.value_amplitude.bias'}
+             'physiology_modulator.value_amplitude.bias',
+             'physiology_encoder.rgb_statistics.weight',
+             'physiology_encoder.rgb_statistics.bias'}
     if set(state) != set(current) - fresh:
         raise RuntimeError('Transfer source must have the exact scalar-BVP model schema')
     expected_shapes = {

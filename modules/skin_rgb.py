@@ -18,11 +18,17 @@ def skin_rgb_means(video, masks):
     return (video * masks).sum(dim=(-2, -1)) / area
 
 
-def normalize_skin_rgb(values):
+def skin_rgb_statistics(values):
+    """Return the physical-scale per-window channel means and deviations."""
     if values.ndim != 3 or values.shape[-1] != 3 or values.shape[1] < 2:
         raise ValueError('skin RGB must have shape [B,T,3] with T >= 2')
     if not torch.isfinite(values).all():
         raise ValueError('skin RGB must be finite')
     values = values.float()
-    return (values - values.mean(dim=1, keepdim=True)) / values.std(
-        dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
+    return values.mean(dim=1, keepdim=True), values.std(
+        dim=1, keepdim=True, unbiased=False)
+
+
+def normalize_skin_rgb(values):
+    mean, deviation = skin_rgb_statistics(values)
+    return (values.float() - mean) / deviation.clamp_min(1e-6)
