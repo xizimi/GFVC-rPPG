@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import importlib.util
 import sys
+from modules.physiology_motion import MotionAlignedPhysioModulator
 
 
 class RPPGEncoder(nn.Module):
@@ -226,13 +227,19 @@ class TemporalRPPGEncoder(nn.Module):
     """Encode a complete waveform into one conditioning vector per frame.
 
     The module is deliberately fully-convolutional in time so training and
-    inference may use different window lengths. Input and output are
-    ``(batch, time)`` and ``(batch, time, embedding_dim)`` respectively.
+    inference may use different window lengths. Scalar BVP input is
+    ``(batch, time)``; skin RGB input is ``(batch, time, 3)``. Output is
+    ``(batch, time, embedding_dim)``.
     """
 
-    def __init__(self, embedding_dim=64, hidden_dim=64, num_blocks=4):
+    def __init__(self, embedding_dim=64, hidden_dim=64, num_blocks=4, input_channels=1):
         super().__init__()
-        self.input = nn.Conv1d(1, hidden_dim, kernel_size=7, padding=3)
+        if input_channels not in (1, 3):
+            raise ValueError('Temporal physiology input must have 1 or 3 channels')
+        self.input_channels = input_channels
+        self.input = nn.Conv1d(input_channels, hidden_dim, kernel_size=7, padding=3)
+        if input_channels == 3:
+            self.rgb_statistics = nn.Linear(3, embedding_dim)
         blocks = []
         for dilation in [2 ** i for i in range(num_blocks)]:
             padding = dilation * 2
@@ -247,6 +254,13 @@ class TemporalRPPGEncoder(nn.Module):
         self.output = nn.Conv1d(hidden_dim, embedding_dim, kernel_size=1)
 
     def forward(self, waveform):
+        if self.input_channels == 3:
+            from modules.skin_rgb import normalize_skin_rgb, skin_rgb_statistics
+            _, deviation = skin_rgb_statistics(waveform)
+            x = F.silu(self.input(normalize_skin_rgb(waveform).transpose(1, 2)))
+            for block in self.blocks:
+                x = x + block(x)
+            return self.output(x).transpose(1, 2) + self.rgb_statistics(deviation)
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
         if waveform.dim() != 2:
@@ -304,9 +318,8 @@ class SkinPhysiologyResidual(nn.Module):
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_channels, 3, 1),
         )
-        # Keep the initial modulation imperceptibly small, but not exactly zero:
-        # an all-zero colour head blocks useful first-step gradients to the
-        # spatial response maps and can leave the physiological branch dormant.
+        # The initial model is exactly the frozen GFVC output. Gradients first
+        # open the colour/amplitude heads, then train spatial response maps.
         nn.init.normal_(self.colour_direction[-1].weight, mean=0.0, std=2e-2)
         nn.init.zeros_(self.colour_direction[-1].bias)
         nn.init.zeros_(self.amplitude[-1].weight)
