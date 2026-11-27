@@ -14,11 +14,15 @@ FUSION_MODES = ('rgb_residual', 'feature_unaligned', 'feature_motion_aligned', '
 class MotionAlignedPhysioModulator(nn.Module):
     def __init__(self, reference_channels=32, depth=16, feature_channels=256,
                  condition_dim=64, rank=2, hidden_channels=16,
-                 max_feature_delta=0.1, initial_strength=0.1, value_channels=1):
+                 max_feature_delta=0.1, initial_strength=0.1, value_channels=1,
+                 rgb_amplitude_gain=1.0):
         super().__init__()
         if rank < 1 or depth < 1 or not 0 < initial_strength < 1 or max_feature_delta <= 0:
             raise ValueError('Invalid rank/depth/modulation strength')
         self.value_channels = value_channels
+        if not math.isfinite(rgb_amplitude_gain) or rgb_amplitude_gain <= 0:
+            raise ValueError('RGB amplitude gain must be positive and finite')
+        self.rgb_amplitude_gain = float(rgb_amplitude_gain)
         self.value_amplitude = nn.Linear(3, 1, bias=False) if value_channels == 3 else None
         self.rank, self.depth = int(rank), int(depth)
         self.feature_channels = int(feature_channels)
@@ -60,7 +64,8 @@ class MotionAlignedPhysioModulator(nn.Module):
         if c != self.feature_channels or condition.ndim != 2 or condition.shape[0] != b:
             raise ValueError('Invalid generated features or temporal condition')
         value = physiology_value.reshape(b, self.value_channels)
-        amplitude = self.value_amplitude(value) if self.value_amplitude is not None else value
+        amplitude = (self.value_amplitude(value) * self.rgb_amplitude_gain
+                     if self.value_amplitude is not None else value)
         basis = self.align_basis(reference_basis, deformation, deform_input, aligned)
         if basis.shape != (b, self.rank, self.depth, h, w):
             raise ValueError('Warped basis must match GFVC feature spatial dimensions')

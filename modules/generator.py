@@ -306,7 +306,8 @@ class OcclusionAwareSPADEGenerator(nn.Module):
                 hidden_channels=physiology_params.get('basis_channels', 16),
                 max_feature_delta=physiology_params.get('max_feature_delta', 0.1),
                 initial_strength=physiology_params.get('initial_feature_strength', 0.1),
-                value_channels=3 if self.physiology_input_mode == 'skin_rgb' else 1)
+                value_channels=3 if self.physiology_input_mode == 'skin_rgb' else 1,
+                rgb_amplitude_gain=physiology_params.get('rgb_amplitude_gain', 1.0))
 
     def deform_input(self, inp, deformation):
         # Explicit defaults preserve the pre-existing GFVC convention. Its

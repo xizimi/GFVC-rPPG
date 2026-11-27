@@ -29,6 +29,12 @@ zero direct amplitude drive. Training and inference share `center_skin_rgb`.
 The reference basis, existing motion warp, skin/visibility gating and GFVC decoder
 continue to operate through the same feature modulation path.
 
+The Epoch 29 + 10 PS-FV2V run uses `physiology_params.rgb_amplitude_gain: 100.0`.
+This gain scales the signed RGB amplitude projection before `tanh`. For inference
+with that checkpoint, construct the generator from the checkpoint's stored
+`config` to recover the experiment value. The default gain is `1.0` and applies
+to the RGB projection only.
+
 `GFVCRPPGSequenceModel` computes conditioning from `driving_video` and `skin_masks`.
 Its scalar `target_rppg` remains the supervision and metric reference. The current
 experiment uses aligned contact PPG labels. This network change does not convert
